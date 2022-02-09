@@ -19,6 +19,8 @@ from apex.optimizers import FusedSGD as SGD
 from megatron import get_args
 from megatron.model import LayerNorm
 
+from torch.optim import Adam
+
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
@@ -53,6 +55,10 @@ def get_megatron_optimizer(model):
     # Base optimizer.
     param_groups = _get_params_for_weight_decay_optimization(model)
     if args.optimizer == 'adam':
+        if args.optimizer_fusion:
+            from apex.optimizers import FusedAdam as Adam
+        else:
+            from torch.optim import Adam
         optimizer = Adam(param_groups,
                          lr=args.lr,
                          weight_decay=args.weight_decay,

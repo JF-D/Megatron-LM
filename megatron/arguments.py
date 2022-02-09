@@ -17,6 +17,7 @@
 
 import argparse
 import os
+import re
 
 import torch
 
@@ -53,9 +54,35 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
+    # setup environment
+    if args.launch == 'slurm':
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_rank = int(os.environ['SLURM_LOCALID'])
+        node_list = str(os.environ['SLURM_NODELIST'])
+        node_parts = re.findall('[0-9]+', node_list)
+
+        os.environ[
+            'MASTER_ADDR'] = f'{node_parts[1]}.{node_parts[2]}.{node_parts[3]}.{node_parts[4]}'
+        os.environ['MASTER_PORT'] = str(args.port)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['RANK'] = str(rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+    elif args.launch == 'mpirun':
+        local_rank = int(os.environ.get('OMPI_COMM_WORLD_LOCAL_RANK', 0))
+        rank = int(os.environ.get('OMPI_COMM_WORLD_RANK', 0))
+        world_size = int(os.environ.get('OMPI_COMM_WORLD_SIZE', 1))
+        os.environ['MASTER_ADDR'] = args.master_addr
+        os.environ['MASTER_PORT'] = args.port
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['RANK'] = str(rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    if args.rank == 0:
+        print(f'Launch with {args.launch} ...')
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -303,7 +330,7 @@ def _add_inference_args(parser):
 
     return parser
 
-    
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -496,6 +523,12 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
+    group.add_argument('--no-optimizer-fusion', action='store_false',
+                       help='Fuse optimizer',
+                       dest='optimizer_fusion')
+    group.add_argument('--no-layernorm-fusion', action='store_false',
+                       help='Fuse layernorm',
+                       dest='layernorm_fusion')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
@@ -509,6 +542,11 @@ def _add_training_args(parser):
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
+    group.add_argument('--hook', action='store_true')
+    group.add_argument('--timeline', action='store_true')
+    group.add_argument('--launch', type=str, default=None)
+    group.add_argument('--master-addr', type=str, default='localhost')
+    group.add_argument('--port', type=str, default='12355')
     return parser
 
 
@@ -757,6 +795,10 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--vocab-size', type=int, default=40478,
+                       help='Vocab size used in synthetic data.')
+    group.add_argument('--synthetic', action='store_true',
+                       help='Synthetic data.')
 
     return parser
 

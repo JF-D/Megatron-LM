@@ -93,8 +93,20 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
                        defaults=args_defaults,
                        ignore_unknown_args=ignore_unknown_args)
     _build_num_microbatches_calculator(args)
-    if args.vocab_file:
-        _ = _build_tokenizer(args)
+    if args.synthetic:
+        after = args.vocab_size
+        multiple = args.make_vocab_size_divisible_by * \
+            args.tensor_model_parallel_size
+        while (after % multiple) != 0:
+            after += 1
+        args.padded_vocab_size = after
+        if args.rank == 0:
+            print(' > padded vocab (size: {}) with {} dummy tokens '
+                  '(new size: {})'.format(
+                  args.vocab_size, after - args.vocab_size, after), flush=True)
+    else:
+        if args.vocab_file:
+            _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
     _set_timers()

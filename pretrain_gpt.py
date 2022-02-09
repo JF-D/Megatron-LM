@@ -44,18 +44,37 @@ def model_provider(pre_process=True, post_process=True):
 def get_batch(data_iterator):
     """Generate a batch"""
     args = get_args()
-    tokenizer = get_tokenizer()
 
-    # Items and their type.
-    keys = ['text']
-    datatype = torch.int64
+    if args.synthetic:
+        if not data_iterator.initialized:
+            datas_ = data_iterator.data
+            tokens = datas_[:, :-1].contiguous()
+            labels = datas_[:, 1:].contiguous()
+            # Get the masks and postition ids.
+            attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+                tokens,
+                args.padded_vocab_size - 1,
+                args.reset_position_ids,
+                args.reset_attention_mask,
+                args.eod_mask_loss)
 
-    # Broadcast data.
-    if data_iterator is not None:
-        data = next(data_iterator)
+            data_iterator.initialize(tokens, labels, loss_mask, attention_mask, position_ids)
+
+        tokens, labels, loss_mask, attention_mask, position_ids = next(data_iterator)
+        return tokens, labels, loss_mask, attention_mask, position_ids
     else:
-        data = None
-    data_b = mpu.broadcast_data(keys, data, datatype)
+        # Items and their type.
+        keys = ['text']
+        datatype = torch.int64
+
+        # Broadcast data.
+        if data_iterator is not None:
+            data = next(data_iterator)
+        else:
+            data = None
+        data_b = mpu.broadcast_data(keys, data, datatype)
+
+    tokenizer = get_tokenizer()
 
     # Unpack.
     tokens_ = data_b['text'].long()

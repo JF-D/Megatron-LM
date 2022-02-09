@@ -141,6 +141,16 @@ def pretrain(train_valid_test_dataset_provider,
     timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'])
     print_rank_0('training ...')
 
+    if args.synthetic:
+        benchmark(forward_step_func,
+                  model, optimizer, lr_scheduler,
+                  train_data_iterator)
+
+        args.do_train = False
+        args.do_valid = False
+        args.save = False
+        args.do_test = False
+
     iteration = 0
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
@@ -431,7 +441,7 @@ def train_step(forward_step_func, data_iterator,
                 grad = word_embeddings_weight.grad
             torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
 
-    # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
+    # All-reduce position_embeddings grad across first (encoder) and split (decoder)
     # stages to ensure that position embeddings parameters stay in sync.
     # This should only run for T5 models with pipeline parallelism
     if mpu.is_rank_in_position_embedding_group() and \
@@ -658,6 +668,121 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
     timers.log(['save-checkpoint'])
 
 
+def benchmark(forward_step_func, model, optimizer, lr_scheduler,
+              train_data_iterator, *args):
+    """Train the model function."""
+    args = get_args()
+    timers = get_timers()
+
+    # Turn on training mode which enables dropout.
+    for model_module in model:
+        model_module.train()
+
+    # Tracking loss.
+    total_loss_dict = {}
+
+    # Iterations.
+    iteration = args.iteration
+
+    if args.hook:
+        visited = {}
+
+        cnt = 0
+
+        def hook(module, ins, outs):
+            if module in visited:
+                return outs
+            visited[module] = True
+            in_shape = []
+            for x in ins:
+                in_shape.append(x.size())
+            for w in module.parameters():
+                in_shape.append(w.size())
+            out_shape = []
+            if isinstance(outs, (tuple, list)):
+                for out in outs:
+                    out_shape.append(out.size() if out is not None else [])
+            else:
+                out_shape.append(outs.size() if outs is not None else [])
+            nonlocal cnt
+            if args.rank == 0:
+                print(cnt, module)
+                print(' ' * 4, module.__class__.__name__, in_shape, out_shape)
+                print(' ' * 4, 'Memory alloc: ',
+                      torch.cuda.memory_allocated() / 1024 / 1024, 'MB')
+            cnt += 2
+            return outs
+
+        if args.rank == 0:
+            print(model)
+        for name, module in model[0].named_modules():
+            if isinstance(module, torch.nn.Sequential):
+                continue
+            if len(list(module.children())) != 0:
+                continue
+            module.register_forward_hook(hook)
+
+    # warmup
+    for _ in range(2):
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+            train_step(forward_step_func,
+                       train_data_iterator,
+                       model,
+                       optimizer,
+                       lr_scheduler)
+
+    torch.cuda.synchronize()
+    st = time.perf_counter()
+    for i in range(10):
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+            train_step(forward_step_func,
+                       train_data_iterator,
+                       model,
+                       optimizer,
+                       lr_scheduler)
+    torch.cuda.synchronize()
+    ed = time.perf_counter()
+    print(f'Speed: {(ed - st) * 1000 / 10:.3f}ms/iter')
+
+    if args.timeline:
+        with torch.autograd.profiler.profile(use_cuda=True) as prof:
+            for i in range(5):
+                loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                    train_step(forward_step_func,
+                               train_data_iterator,
+                               model,
+                               optimizer,
+                               lr_scheduler)
+        prof.export_chrome_trace('log/gpt-{}.json'.format(args.num_layers))
+
+    timers('interval-time').start()
+    print_datetime('before the start of training step')
+    report_memory_flag = True
+    for iteration in range(20):
+        update_num_microbatches(args.consumed_train_samples)
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+            train_step(forward_step_func,
+                       train_data_iterator,
+                       model,
+                       optimizer,
+                       lr_scheduler)
+        iteration += 1
+        args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
+                                       args.micro_batch_size * \
+                                       get_num_microbatches()
+
+        # Logging.
+        loss_scale = optimizer.get_loss_scale().item()
+        params_norm = None
+        if args.log_params_norm:
+            params_norm = calc_params_l2_norm(model)
+        report_memory_flag = training_log(loss_dict, total_loss_dict,
+                                          optimizer.param_groups[0]['lr'],
+                                          iteration, loss_scale,
+                                          report_memory_flag, skipped_iter,
+                                          grad_norm, params_norm, num_zeros_in_grad)
+
+
 def train(forward_step_func, model, optimizer, lr_scheduler,
           train_data_iterator, valid_data_iterator):
     """Train the model function."""
@@ -845,6 +970,33 @@ def cyclic_iter(iter):
         for x in iter:
             yield x
 
+
+class SyntheticDL:
+    def __init__(self, batch_size, seq_length, vocab_size):
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.vacab_size = vocab_size
+
+        size = (self.batch_size, self.seq_length + 1)
+        self.data = torch.randint(0, vocab_size, size, dtype=torch.int64)
+
+        self.initialized = False
+
+    def initialize(self, tokens, labels, loss_mask, attention_mask, position_ids):
+        self.initialized = True
+        self.tokens = tokens.cuda()
+        self.labels = labels.cuda()
+        self.loss_mask = loss_mask.cuda()
+        self.attention_mask = attention_mask.cuda()
+        self.position_ids = position_ids.cuda()
+
+    def __next__(self):
+        if self.initialized:
+            return self.tokens, self.labels, self.loss_mask, self.attention_mask, self.position_ids
+        else:
+            return None
+
+
 def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
     """XXX"""
@@ -863,6 +1015,23 @@ def build_train_valid_test_data_iterators(
         if args.train_samples is None:
             args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
                 args.eval_iters * args.global_batch_size
+
+    if args.synthetic:
+        # if mpu.get_tensor_model_parallel_rank() == 0:
+        #     flags = torch.cuda.LongTensor([1, 0, 0])
+        # else:
+        #     flags = torch.cuda.LongTensor([0, 0, 0])
+        train_data_iterator = SyntheticDL(args.micro_batch_size, args.seq_length, args.padded_vocab_size)
+        flags = torch.cuda.LongTensor([1, 0, 0])
+
+        # Broadcast num tokens.
+        torch.distributed.broadcast(flags,
+                                    mpu.get_tensor_model_parallel_src_rank(),
+                                    group=mpu.get_tensor_model_parallel_group())
+        args.do_train = flags[0].item()
+        args.do_valid = flags[1].item()
+        args.do_test = flags[2].item()
+        return train_data_iterator, None, None
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_tensor_model_parallel_rank() == 0:

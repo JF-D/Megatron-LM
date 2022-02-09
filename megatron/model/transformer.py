@@ -187,7 +187,7 @@ class ParallelAttention(MegatronModule):
             self.hidden_size_per_attention_head,
             dtype=self.params_dtype,
             device=torch.cuda.current_device())
-        
+
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None):
@@ -420,10 +420,15 @@ class ParallelTransformerLayer(MegatronModule):
         self.fp32_residual_connection = args.fp32_residual_connection
 
         # Layernorm on the input data.
-        self.input_layernorm = LayerNorm(
-            args.hidden_size,
-            eps=args.layernorm_epsilon,
-            no_persist_layer_norm=args.no_persist_layer_norm)
+        if args.layernorm_fusion:
+            self.input_layernorm = LayerNorm(
+                args.hidden_size,
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm)
+        else:
+            self.input_layernorm = torch.nn.LayerNorm(
+                args.hidden_size,
+                eps=args.layernorm_epsilon)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -434,12 +439,18 @@ class ParallelTransformerLayer(MegatronModule):
             attn_mask_type=self_attn_mask_type)
         self.hidden_dropout = args.hidden_dropout
         self.bias_dropout_fusion = args.bias_dropout_fusion
+        self.dropout = torch.nn.Dropout(p=0.5)
 
         # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNorm(
-            args.hidden_size,
-            eps=args.layernorm_epsilon,
-            no_persist_layer_norm=args.no_persist_layer_norm)
+        if args.layernorm_fusion:
+            self.post_attention_layernorm = LayerNorm(
+                args.hidden_size,
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm)
+        else:
+            self.post_attention_layernorm = torch.nn.LayerNorm(
+                args.hidden_size,
+                eps=args.layernorm_epsilon)
 
         if self.layer_type == LayerType.decoder:
             self.inter_attention = ParallelAttention(
@@ -448,10 +459,15 @@ class ParallelTransformerLayer(MegatronModule):
                 layer_number,
                 attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
-            self.post_inter_attention_layernorm = LayerNorm(
-                args.hidden_size,
-                eps=args.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm)
+            if args.layernorm_fusion:
+                self.post_inter_attention_layernorm = LayerNorm(
+                    args.hidden_size,
+                    eps=args.layernorm_epsilon,
+                    no_persist_layer_norm=args.no_persist_layer_norm)
+            else:
+                self.post_inter_attention_layernorm = torch.nn.LayerNorm(
+                    args.hidden_size,
+                    eps=args.layernorm_epsilon)
 
         # MLP
         self.mlp = ParallelMLP(init_method,
@@ -612,10 +628,15 @@ class ParallelTransformer(MegatronModule):
 
         if self.post_process:
             # Final layer norm before output.
-            self.final_layernorm = LayerNorm(
-                args.hidden_size,
-                eps=args.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm)
+            if args.layernorm_fusion:
+                self.final_layernorm = LayerNorm(
+                    args.hidden_size,
+                    eps=args.layernorm_epsilon,
+                    no_persist_layer_norm=args.no_persist_layer_norm)
+            else:
+                self.final_layernorm = torch.nn.LayerNorm(
+                    args.hidden_size,
+                    eps=args.layernorm_epsilon)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -705,7 +726,7 @@ class ParallelTransformer(MegatronModule):
         #   However, we don't explicitly check mbs == 1 here because
         #   make_viewless_tensor() has negligible overhead when its input
         #   is already viewless.
-        # 
+        #
         # - For the 'else' case above, calling make_viewless_tensor() here is
         #   likely redundant, since p2p_communication.py (likely originator)
         #   already creates viewless tensors. That said, make_viewless_tensor()
@@ -744,5 +765,5 @@ class ParallelTransformer(MegatronModule):
             output = self.final_layernorm(hidden_states)
         else:
             output = hidden_states
-        
+
         return output
