@@ -1,15 +1,15 @@
 #! /bin/bash
 
 # model param
-nlayer=8
+nlayer=6
 seq_length=1024
 hidden_size=1024
 nheads=16
 
 # training param
-ndev=8
-global_bs=8
-micro_bs=2
+ndev=2
+global_bs=4
+micro_bs=4
 pp_deg=2
 mp_deg=1
 dp_deg=$(( $ndev / $(( $pp_deg \* $mp_deg )) ))
@@ -18,7 +18,10 @@ activation= #"--activations-checkpoint-method uniform"
 
 vocab_size=40478
 
-mpirun -np $ndev python pretrain_gpt.py \
+sudo mpirun -np $ndev --allow-run-as-root \
+       $(which nvprof) --profile-from-start off \
+       -o log/gpt_n8_%p.nvvp -f \
+       /home/duanjiangfei/env/miniconda3/envs/pt1.8v1/bin/python pretrain_gpt.py \
        --num-layers $nlayer \
        --seq-length $seq_length \
        --max-position-embeddings $seq_length \
@@ -50,4 +53,5 @@ mpirun -np $ndev python pretrain_gpt.py \
        --eval-interval 1000 \
        --eval-iters 10 \
        --launch mpirun \
-       --synthetic
+       --no-async-tensor-model-parallel-allreduce \
+       --synthetic --no-compile --timeline

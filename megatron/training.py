@@ -745,15 +745,25 @@ def benchmark(forward_step_func, model, optimizer, lr_scheduler,
     print(f'Speed: {(ed - st) * 1000 / 10:.3f}ms/iter')
 
     if args.timeline:
-        with torch.autograd.profiler.profile(use_cuda=True) as prof:
-            for i in range(5):
-                loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-                    train_step(forward_step_func,
-                               train_data_iterator,
-                               model,
-                               optimizer,
-                               lr_scheduler)
-        prof.export_chrome_trace('log/gpt-{}.json'.format(args.num_layers))
+        torch.cuda.cudart().cudaProfilerStart()
+        for i in range(5):
+            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                           train_data_iterator,
+                           model,
+                           optimizer,
+                           lr_scheduler)
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        # with torch.autograd.profiler.profile(use_cuda=True) as prof:
+        #     for i in range(5):
+        #         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+        #             train_step(forward_step_func,
+        #                        train_data_iterator,
+        #                        model,
+        #                        optimizer,
+        #                        lr_scheduler)
+        # prof.export_chrome_trace('log/gpt-{}.json'.format(args.num_layers))
 
     timers('interval-time').start()
     print_datetime('before the start of training step')

@@ -543,6 +543,7 @@ def _add_training_args(parser):
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
     group.add_argument('--hook', action='store_true')
+    group.add_argument('--no-compile', action='store_true')
     group.add_argument('--timeline', action='store_true')
     group.add_argument('--launch', type=str, default=None)
     group.add_argument('--master-addr', type=str, default='localhost')

@@ -94,6 +94,8 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 def _compile_dependencies():
 
     args = get_args()
+    if args.no_compile:
+        return
 
     # =========================
     # Compile dataset C++ code.
