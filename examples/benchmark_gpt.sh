@@ -1,24 +1,25 @@
 #! /bin/bash
 
 # model param
-nlayer=8
+nlayer=24
 seq_length=1024
 hidden_size=1024
 nheads=16
 
 # training param
 ndev=8
-global_bs=8
-micro_bs=2
-pp_deg=2
-mp_deg=1
+global_bs=1
+micro_bs=1
+pp_deg=1
+mp_deg=8
 dp_deg=$(( $ndev / $(( $pp_deg \* $mp_deg )) ))
 
 activation= #"--activations-checkpoint-method uniform"
 
 vocab_size=40478
 
-mpirun -np $ndev python pretrain_gpt.py \
+# NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=GRAPH \
+deepspeed --num_nodes 1 --num_gpus $ndev pretrain_gpt.py \
        --num-layers $nlayer \
        --seq-length $seq_length \
        --max-position-embeddings $seq_length \
@@ -45,9 +46,8 @@ mpirun -np $ndev python pretrain_gpt.py \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
        --lr-warmup-fraction .01 \
-       --log-interval 10 \
+       --log-interval 1 \
        --save-interval 10000 \
        --eval-interval 1000 \
        --eval-iters 10 \
-       --launch mpirun \
        --synthetic
