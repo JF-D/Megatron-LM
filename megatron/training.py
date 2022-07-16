@@ -287,7 +287,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if args.DDP_impl == 'torch':
             i = torch.cuda.current_device()
             model = [torchDDP(model_module, device_ids=[i], output_device=i,
-                              process_group=mpu.get_data_parallel_group())
+                              process_group=mpu.get_data_parallel_group(), bucket_cap_mb=600)
                      for model_module in model]
 
         elif args.DDP_impl == 'local':
@@ -764,11 +764,12 @@ def benchmark(forward_step_func, model, optimizer, lr_scheduler,
         #                        optimizer,
         #                        lr_scheduler)
         # prof.export_chrome_trace('log/gpt-{}.json'.format(args.num_layers))
+        exit()
 
     timers('interval-time').start()
     print_datetime('before the start of training step')
     report_memory_flag = True
-    for iteration in range(20):
+    for iteration in range(100):
         update_num_microbatches(args.consumed_train_samples)
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,

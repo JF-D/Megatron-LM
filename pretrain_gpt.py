@@ -97,7 +97,8 @@ def loss_func(loss_mask, output_tensor):
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
     # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
+    # averaged_loss = average_losses_across_data_parallel_group([loss])
+    averaged_loss = [loss.item()]
 
     return loss, {'lm loss': averaged_loss[0]}
 
