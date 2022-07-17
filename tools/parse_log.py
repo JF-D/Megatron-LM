@@ -17,13 +17,11 @@ def read_log(filename):
     return min(speeds) if len(speeds) > 0 else 0, memory
 
 if __name__ == '__main__':
-    a = read_log('log/gpt2_dp_1.log')
-
     stats = {}
     for filename in os.listdir('log'):
         if not filename.endswith('.log'):
             continue
-        model, ps, ndev = filename.split('.')[0].split('_')
+        model, ps, ndev = filename[:-4].split('_')
         ndev = int(ndev)
         if model not in stats:
             stats[model] = {}

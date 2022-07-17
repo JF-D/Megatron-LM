@@ -2,11 +2,13 @@
 
 # model param
 # GPT-1.5B
-# nlayer=48
-# seq_length=1024
-# hidden_size=1600
-# nheads=16
-# model=gpt1.5b
+nlayer=48
+seq_length=1024
+hidden_size=1600
+nheads=16
+model=gpt1.5b
+bs=1
+vocab_size=50257
 
 # GPT-12L
 # nlayer=12
@@ -14,13 +16,17 @@
 # hidden_size=1024
 # nheads=16
 # model=gpt12l
+# bs=4
+# vocab_size=40478
 
 # GPT-2
-nlayer=12
-seq_length=1024
-hidden_size=768
-nheads=12
-model=gpt2
+# nlayer=12
+# seq_length=1024
+# hidden_size=768
+# nheads=12
+# model=gpt2
+# bs=4
+# vocab_size=40478
 
 # training param
 # ndev=16
@@ -36,24 +42,31 @@ PROF=$3
 
 g=$(($ndev<8?$ndev:8))
 
-global_bs=$(( ${ndev} * 4 ))
-n_micro_batch=1
-pp_deg=1
+global_bs=$(( ${ndev} * ${bs} ))
 if [ "${ps}" = "mp" ]; then
     if [ "${model}" = "gpt2" ]; then
         mp_deg=$(($ndev<4?$ndev:4))
     else
-        mp_deg=$ndev
+        mp_deg=$g
     fi
 else
     mp_deg=1
 fi
+if [ "${model}" = "gpt1.5b" -a "${ps}" = "mp" ]; then
+    pp_deg=$(( $ndev / ${mp_deg} ))
+    if [ ${pp_deg} -gt 1 ]; then
+        n_micro_batch=8
+    else
+        n_micro_batch=1
+    fi
+else
+    pp_deg=1
+    n_micro_batch=1
+fi
 dp_deg=$(( $ndev / $(( $pp_deg * $mp_deg )) ))
 micro_bs=$(( ${global_bs} / $(( ${dp_deg} * ${n_micro_batch} )) )) # global_bs / dp_deg / n_macro_batch
 
-activation= #"--activations-checkpoint-method uniform"
-
-vocab_size=40478
+activation="--activations-checkpoint-method uniform"
 
 prefix=${model}_${ps}
 
@@ -87,8 +100,8 @@ srun -p pat_test -x SH-IDC1-10-198-4-[185] -n $ndev --gres=gpu:$g --tasks-per-no
        --openai-gelu --no-optimizer-fusion --no-layernorm-fusion \
        --no-async-tensor-model-parallel-allreduce \
        --DDP-impl ${ddp_impl} $activation \
-       --pipeline-model-parallel-size $pp_deg \
-       --tensor-model-parallel-size $mp_deg \
+       --pipeline-model-parallel-size ${pp_deg} \
+       --tensor-model-parallel-size ${mp_deg} \
        --train-iters 500000 \
        --lr-decay-iters 320000 \
        --vocab-file gpt2-vocab.json \
