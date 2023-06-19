@@ -9,7 +9,6 @@ import torch
 import types
 
 from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -357,6 +356,7 @@ def validate_args(args, defaults={}):
 
     # Load retro args.
     if args.retro_workdir:
+        from tools.retro.utils import get_args_path as get_retro_args_path
         retro_args_path = get_retro_args_path(args.retro_workdir)
         if os.path.exists(retro_args_path):
             with open(retro_args_path) as f:
