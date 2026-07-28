@@ -2073,64 +2073,21 @@ def setup_model_and_optimizer(
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
 
-    if args.runtime_comm_planner_mode != "off":
-        from megatron.core.communication_planner.runtime import (
-            RuntimePlannerConfig,
-            RuntimePlannerMode,
-            configure_runtime_comm_planner,
+    if getattr(args, 'gtp_runtime_profile', False):
+        if not is_gtp_remat_active(args):
+            raise ValueError('--gtp-runtime-profile requires GTP weight rematerialization')
+        if getattr(args, 'cuda_graph_impl', 'none') != 'none':
+            raise ValueError('--gtp-runtime-profile currently supports eager execution only')
+        from megatron.core.communication_planner import (
+            GTPRuntimeProfileConfig,
+            configure_gtp_runtime_profiler,
         )
 
-        runtime_signature = {
-            "world_size": args.world_size,
-            "tensor_parallel_size": args.tensor_model_parallel_size,
-            "gtp_size": args.gtp_weight_remat_size,
-            "expert_parallel_size": args.expert_model_parallel_size,
-            "expert_gtp_size": args.expert_gtp_weight_remat_size,
-            "pipeline_parallel_size": args.pipeline_model_parallel_size,
-            "context_parallel_size": args.context_parallel_size,
-            "micro_batch_size": args.micro_batch_size,
-            "global_batch_size": args.global_batch_size,
-            "sequence_length": args.seq_length,
-            "num_layers": args.num_layers,
-            "cuda_graph_impl": getattr(args, "cuda_graph_impl", "none"),
-            "cuda_graph_modules": sorted(
-                str(module) for module in (getattr(args, "cuda_graph_modules", None) or [])
-            ),
-            "seed": args.seed,
-            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-            "slurm_node_count": os.environ.get("SLURM_JOB_NUM_NODES"),
-            "cuda_device": torch.cuda.get_device_name(torch.cuda.current_device()),
-            "parallel_coordinates": {
-                "tensor_parallel_rank": mpu.get_tensor_model_parallel_rank(),
-                "pipeline_parallel_rank": mpu.get_pipeline_model_parallel_rank(),
-                "context_parallel_rank": mpu.get_context_parallel_rank(),
-                "data_parallel_rank": mpu.get_data_parallel_rank(),
-                "expert_parallel_rank": mpu.get_expert_model_parallel_rank(),
-                "gtp_rank": mpu.get_gtp_weight_remat_rank(),
-                "expert_gtp_rank": mpu.get_expert_gtp_weight_remat_rank(),
-            },
-            "communicator_memberships": {
-                "dense_gtp": torch.distributed.get_process_group_ranks(
-                    mpu.get_gtp_weight_remat_group()
-                ),
-                "expert_gtp": torch.distributed.get_process_group_ranks(
-                    mpu.get_expert_gtp_weight_remat_group()
-                ),
-                "expert_parallel": torch.distributed.get_process_group_ranks(
-                    mpu.get_expert_tensor_and_model_parallel_group()
-                ),
-            },
-        }
-        configure_runtime_comm_planner(
-            RuntimePlannerConfig(
-                mode=RuntimePlannerMode(args.runtime_comm_planner_mode),
-                warmup_iters=args.runtime_comm_planner_warmup_iters,
-                profile_iters=args.runtime_comm_planner_profile_iters,
-                replan_interval=args.runtime_comm_planner_replan_interval,
-                log_dir=args.runtime_comm_planner_log_dir,
-                dump_plan=args.runtime_comm_planner_dump_plan,
-                validate_ranks=args.runtime_comm_planner_validate_ranks,
-                runtime_signature=runtime_signature,
+        configure_gtp_runtime_profiler(
+            GTPRuntimeProfileConfig(
+                warmup_iters=args.gtp_runtime_profile_warmup_iters,
+                profile_iters=args.gtp_runtime_profile_iters,
+                log_dir=Path(args.gtp_runtime_profile_log_dir),
             ),
             model=model,
         )
@@ -3890,29 +3847,12 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
-            from megatron.core.communication_planner.runtime import get_runtime_comm_planner
+            from megatron.core.communication_planner import get_gtp_runtime_profiler
 
-            runtime_comm_planner = get_runtime_comm_planner()
-            if runtime_comm_planner.active:
-                runtime_comm_planner.begin_iteration(iteration)
-                try:
-                    (
-                        loss_dict,
-                        skipped_iter,
-                        should_checkpoint,
-                        should_exit,
-                        exit_code,
-                        grad_norm,
-                        num_zeros_in_grad,
-                        max_attention_logit,
-                    ) = train_step(
-                        forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
-                        pg_collection=pg_collection,
-                        p2p_communicator=p2p_communicator,
-                    )
-                finally:
-                    runtime_comm_planner.end_iteration()
-            else:
+            gtp_runtime_profiler = get_gtp_runtime_profiler()
+            if gtp_runtime_profiler is not None:
+                gtp_runtime_profiler.begin_iteration(iteration)
+            try:
                 (
                     loss_dict,
                     skipped_iter,
@@ -3923,10 +3863,20 @@ def train(
                     num_zeros_in_grad,
                     max_attention_logit,
                 ) = train_step(
-                    forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
+                    forward_step_func,
+                    train_data_iterator,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    config,
+                    forward_backward_func,
+                    iteration=iteration,
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                 )
+            finally:
+                if gtp_runtime_profiler is not None:
+                    gtp_runtime_profiler.end_iteration()
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
@@ -4179,11 +4129,11 @@ def train(
     if writer:
         writer.flush()
 
-    from megatron.core.communication_planner.runtime import get_runtime_comm_planner
+    from megatron.core.communication_planner import get_gtp_runtime_profiler
 
-    runtime_comm_planner = get_runtime_comm_planner()
-    if runtime_comm_planner.active:
-        runtime_comm_planner.finalize()
+    gtp_runtime_profiler = get_gtp_runtime_profiler()
+    if gtp_runtime_profiler is not None:
+        gtp_runtime_profiler.finalize()
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:

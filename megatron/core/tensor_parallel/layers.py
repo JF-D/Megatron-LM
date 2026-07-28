@@ -515,7 +515,7 @@ def linear_with_frozen_weight(
         input = input
 
     if gtp_remat_size > 1:
-        weight = weight.materialize_group_for_forward()
+        weight = weight.all_gather_and_prefetch(fwd=True)
 
     args = [input, weight, bias, allreduce_dgrad, tp_group]
 
@@ -548,7 +548,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.save_for_backward(input, weight)
 
         if gtp_remat_size > 1:
-            weight = weight.materialize_group_for_forward()
+            weight = weight.all_gather_and_prefetch(fwd=True)
 
         # We can't save main_grad in save_for_backward as this module would be
         # reused across layers like MTP logits. So, to prevent in-place modification
@@ -589,7 +589,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         # GTP: re-gather weight for dgrad
         if ctx.gtp_remat_size > 1:
             sharded_weight = weight
-            weight = sharded_weight.materialize_group_for_backward()
+            weight = sharded_weight.all_gather_and_prefetch_bwd()
             ctx.gradient_accumulation_fusion = False
 
         grad_output_buffer = ctx.grad_output_buffer

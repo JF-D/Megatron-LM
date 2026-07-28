@@ -2814,12 +2814,6 @@ def set_current_microbatch(model, microbatch_id):
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
     """
-    from megatron.core.communication_planner.runtime import get_runtime_comm_planner
-
-    runtime_comm_planner = get_runtime_comm_planner()
-    if runtime_comm_planner.hooks_enabled:
-        runtime_comm_planner.set_microbatch(microbatch_id)
-
     decoder_exists = True
     model_with_decoder = None
     try:

@@ -55,7 +55,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_checkpointing_args(parser)
     parser = _add_mixed_precision_args(parser)
     parser = _add_distributed_args(parser)
-    parser = _add_runtime_comm_planner_args(parser)
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_tokenizer_args(parser)
@@ -1455,21 +1454,6 @@ def validate_args(args, defaults={}):
             getattr(args, "expert_gtp_weight_remat_size", 1),
         )
     )
-
-    if args.runtime_comm_planner_mode != "off":
-        if args.runtime_comm_planner_log_dir is None:
-            raise ValueError(
-                "--runtime-comm-planner-log-dir is required when the runtime "
-                "communication planner is enabled"
-            )
-        if args.runtime_comm_planner_warmup_iters < 1:
-            raise ValueError("--runtime-comm-planner-warmup-iters must be at least one")
-        if args.runtime_comm_planner_profile_iters < 1:
-            raise ValueError("--runtime-comm-planner-profile-iters must be at least one")
-        if args.runtime_comm_planner_replan_interval < 0:
-            raise ValueError("--runtime-comm-planner-replan-interval must be non-negative")
-        if args.gtp_weight_remat_size <= 1 and args.expert_gtp_weight_remat_size <= 1:
-            raise ValueError("The runtime communication planner currently requires GTP")
 
     if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
         if args.fp4 and not args.fp4_param_gather:
@@ -2975,6 +2959,29 @@ def _add_distributed_args(parser):
                        dest='gtp_local_cg_backward_rs_overlap', default=True,
                        help='Disable GTP backward reduce-scatter overlap across local CUDA graph '
                             'boundaries. The overlap is enabled by default when GTP is active.')
+    group.add_argument(
+        '--gtp-runtime-profile',
+        action='store_true',
+        help='Collect a bounded CUDA-event profile of the eager GTP execution chain.',
+    )
+    group.add_argument(
+        '--gtp-runtime-profile-warmup-iters',
+        type=int,
+        default=2,
+        help='Number of eager iterations before GTP CUDA-event profiling begins.',
+    )
+    group.add_argument(
+        '--gtp-runtime-profile-iters',
+        type=int,
+        default=4,
+        help='Number of eager iterations included in the compact GTP execution model.',
+    )
+    group.add_argument(
+        '--gtp-runtime-profile-log-dir',
+        type=str,
+        default='gtp_runtime_profile',
+        help='Directory for rank-local compact GTP execution-model JSON files.',
+    )
     group.add_argument('--ddp-num-buckets', type=int, default=None,
                        help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
@@ -3069,61 +3076,6 @@ def _add_distributed_args(parser):
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
-    return parser
-
-
-def _add_runtime_comm_planner_args(parser):
-    """Add default-off runtime communication planner controls."""
-
-    group = parser.add_argument_group(title='runtime communication planner')
-    group.add_argument(
-        '--runtime-comm-planner-mode',
-        choices=['off', 'shadow', 'enforce'],
-        default='off',
-        help=(
-            'Runtime communication planner mode. Shadow records and compiles a plan '
-            'without changing collective launch timing. Enforce currently falls back '
-            'to shadow until rank and buffer-lifetime validation passes.'
-        ),
-    )
-    group.add_argument(
-        '--runtime-comm-planner-warmup-iters',
-        type=int,
-        default=2,
-        help='Number of eager iterations used to discover and validate the semantic graph.',
-    )
-    group.add_argument(
-        '--runtime-comm-planner-profile-iters',
-        type=int,
-        default=4,
-        help='Number of post-warmup eager iterations profiled with CUDA events.',
-    )
-    group.add_argument(
-        '--runtime-comm-planner-replan-interval',
-        type=int,
-        default=0,
-        help='Iterations between replans; zero disables periodic replanning.',
-    )
-    group.add_argument(
-        '--runtime-comm-planner-log-dir',
-        type=str,
-        default=None,
-        help='Directory for per-rank graph, telemetry, plan, and diagnostic artifacts.',
-    )
-    group.add_argument(
-        '--runtime-comm-planner-dump-plan',
-        action='store_true',
-        help='Dump machine-readable graph, telemetry, and compiled plan artifacts.',
-    )
-    group.add_argument(
-        '--runtime-comm-planner-validate-ranks',
-        type=str,
-        default='0',
-        help=(
-            "Ranks that write validation artifacts: 'all' or a comma-separated list "
-            "such as '0,1,16,31'."
-        ),
-    )
     return parser
 
 

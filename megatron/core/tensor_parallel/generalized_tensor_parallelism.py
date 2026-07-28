@@ -36,7 +36,8 @@ from typing import Dict, List, Optional
 import torch
 from packaging.version import Version
 
-from megatron.core.communication_planner.runtime import get_runtime_comm_planner
+from megatron.core.communication_planner.model import GTPPhase
+from megatron.core.communication_planner.runtime import get_gtp_runtime_profiler
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -118,40 +119,16 @@ _FULL_ITERATION: bool = False  # whole step in one graph -> every param GRAPHED
 _ALL_LAYER_SCOPE_TAGS = frozenset({"mamba", "attn", "moe", "moe_router"})
 
 
-def _runtime_gtp_direction(fwd: bool) -> str:
-    """Return the semantic materialization direction for planner hooks."""
+def _runtime_profile_phase(fwd: bool) -> GTPPhase:
+    """Return the compact profiler phase for one weight materialization."""
 
     if not fwd:
-        return "backward"
-    return "recompute" if in_fp8_activation_recompute_phase() else "forward"
-
-
-def _runtime_tensor_bytes(tensors) -> int:
-    """Best-effort logical payload size for ordinary or quantized tensors."""
-
-    total = 0
-    for tensor in tensors:
-        try:
-            total += int(tensor.numel()) * int(tensor.element_size())
-            continue
-        except (AttributeError, TypeError):
-            pass
-        for name in ("_data", "_rowwise_data", "_columnwise_data"):
-            data = getattr(tensor, name, None)
-            if data is not None and hasattr(data, "numel"):
-                total += int(data.numel()) * int(data.element_size())
-                break
-    return total
-
-
-def _runtime_completion_work(handle):
-    """Return a repeatable NCCL-only wait handle for completion telemetry."""
-
-    if isinstance(handle, BatchedNVFP4AllGatherAsyncHandle):
-        return handle.outer_async_handle
-    if isinstance(handle, _NVFP4AllGatherAsyncHandle):
-        return handle.async_handle
-    return handle
+        return GTPPhase.BACKWARD
+    return (
+        GTPPhase.RECOMPUTE
+        if in_fp8_activation_recompute_phase()
+        else GTPPhase.FORWARD
+    )
 
 
 def set_cuda_graph_modules(
@@ -905,17 +882,10 @@ class GTPShardHandle:
     and prune the param from _inflight_comm_params when the collective completes.
     """
 
-    def __init__(
-        self,
-        handle,
-        gtp_shards,
-        reduce_scatter=False,
-        runtime_planner_token=None,
-    ):
+    def __init__(self, handle, gtp_shards, reduce_scatter=False):
         self.handle = handle
         self.gtp_shards = gtp_shards
         self.reduce_scatter = reduce_scatter
-        self.runtime_planner_token = runtime_planner_token
         _inflight_comm_params.add(gtp_shards[0])
         if _ACTIVE_CAPTURE_COMM_STATE is not None:
             _ACTIVE_CAPTURE_COMM_STATE.register(gtp_shards[0], reduce_scatter)
@@ -925,9 +895,6 @@ class GTPShardHandle:
         if self.handle is not None:
             self.handle.wait()
             self.handle = None  # Release NCCL Work and its C++ tensor references promptly
-        if self.runtime_planner_token is not None:
-            get_runtime_comm_planner().collective_end(self.runtime_planner_token)
-            self.runtime_planner_token = None
         if GTP_CONFIG.check_param_states:
             for w in self.gtp_shards:
                 if self.reduce_scatter:
@@ -1253,6 +1220,16 @@ class GTPShardedParam(torch.nn.Parameter):
         nvtx_range_push(f"{nvtx_label}.all_gather_weight")
 
         weights = self._weights
+        runtime_profiler = get_gtp_runtime_profiler()
+        profile_active = runtime_profiler is not None and runtime_profiler.active
+        runtime_token = (
+            runtime_profiler.ag_ready(
+                self._debug_name,
+                _runtime_profile_phase(fwd),
+            )
+            if profile_active
+            else None
+        )
 
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
         #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
@@ -1290,7 +1267,6 @@ class GTPShardedParam(torch.nn.Parameter):
             dtypes = [q.dtype if q is not None else w.dtype for q, w in zip(quantizers, weights)]
             self._cached_dtypes = dtypes
         out_buffers = []
-        ag_tickets = []
         cache = get_global_GTP_cache()
         for p, dt in zip(weights, dtypes):
             if fwd:
@@ -1298,13 +1274,11 @@ class GTPShardedParam(torch.nn.Parameter):
                     p._ag_ticket_fwd = cache.reserve(p, dt, fwd=True)
                     cache.get(p._ag_ticket_fwd)
                     cache.release(p._ag_ticket_fwd)
-                ticket = p._ag_ticket_fwd
+                out_buffers.append(cache.get(p._ag_ticket_fwd))
             else:
                 if p._ag_ticket_bwd is None:
                     p._ag_ticket_bwd = cache.reserve(p, dt, fwd=False)
-                ticket = p._ag_ticket_bwd
-            ag_tickets.append(ticket)
-            out_buffers.append(cache.get(ticket))
+                out_buffers.append(cache.get(p._ag_ticket_bwd))
 
         # 5. Communicate.
         gtp_remat_group = self._cached_gtp_remat_group
@@ -1317,31 +1291,10 @@ class GTPShardedParam(torch.nn.Parameter):
                 out_buffers
             ), "Duplicate output buffers in batched all-gather — experts need distinct cache keys"
 
-        runtime_planner = get_runtime_comm_planner()
-        runtime_token = None
-        if runtime_planner.hooks_enabled:
-            runtime_token = runtime_planner.gtp_ag_ready(
-                self._debug_name,
-                expert=self.is_routed_expert,
-                direction=_runtime_gtp_direction(fwd),
-                communicator_size=gtp_remat_group.size(),
-                payload_bytes=sum(
-                    GTPWeightCache._buf_bytes(p._unsharded_shape_padded, dt)
-                    for p, dt in zip(weights, dtypes)
-                ),
-                parameter_scopes=tuple(p._debug_name for p in weights),
-                reusable_buffers=tuple(
-                    cache.planner_buffer_spec(ticket) for ticket in ag_tickets
-                ),
-                stream=torch.cuda.current_stream(),
-            )
-
         # ASYNC AG: issue on ag_stream so its tail reflects the collective's full lifecycle
         # (what external wait_stream(ag_stream) drains depend on). The explicit outer→ag_stream
         # sync event preserves the upstream quantize-writer edge the bare stream context drops;
         # held on self so the event pool can't recycle it between capture and replay.
-        # Record planner readiness before this dependency event so the side-stream START
-        # timestamp is ordered after the READY timestamp.
         # SYNC AG: stay on caller — output ready on return.
         if async_op:
             outer_stream = torch.cuda.current_stream()
@@ -1356,8 +1309,10 @@ class GTPShardedParam(torch.nn.Parameter):
             ag_ctx = nullcontext()
 
         with ag_ctx:
-            if runtime_token is not None:
-                runtime_planner.collective_start(runtime_token, torch.cuda.current_stream())
+            if profile_active:
+                runtime_profiler.communication_start(
+                    runtime_token, torch.cuda.current_stream()
+                )
             if len(gather_weights) > 1:
                 nvtx_range_push(f"{nvtx_label}.batched_gtp_ag")
                 results, handle = grouped_gather_along_first_dim(
@@ -1379,25 +1334,16 @@ class GTPShardedParam(torch.nn.Parameter):
                 )
                 nvtx_range_pop(f"{nvtx_label}.gtp_ag")
                 results = [weight_total]
-            if runtime_token is not None and not async_op:
-                runtime_planner.collective_end(runtime_token, torch.cuda.current_stream())
-
-        if runtime_token is not None and async_op:
-            runtime_planner.collective_completion(
-                runtime_token,
-                _runtime_completion_work(handle),
-                keepalive=tuple([*gather_weights, *out_buffers, *results]),
-            )
+            if profile_active:
+                runtime_profiler.communication_end(
+                    runtime_token, torch.cuda.current_stream()
+                )
 
         result = results if self.is_routed_expert else results[0]
 
         # 6. Wrap handle.
         if async_op:
-            handle = GTPShardHandle(
-                handle,
-                weights,
-                runtime_planner_token=runtime_token,
-            )
+            handle = GTPShardHandle(handle, weights)
         else:
             handle = None
 
@@ -1700,13 +1646,7 @@ class GTPShardedParam(torch.nn.Parameter):
             self._cached_rs_stream = rs_stream
         with torch.cuda.stream(rs_stream):
             if self._wgrad_rs_handle is not None:
-                runtime_planner = get_runtime_comm_planner()
-                runtime_hooks = runtime_planner.hooks_enabled
-                if finalize_grad and runtime_hooks:
-                    runtime_planner.gtp_rs_consumer_ready(self._debug_name, rs_stream)
                 self._wgrad_rs_handle.wait()
-                if finalize_grad and runtime_hooks:
-                    runtime_planner.gtp_rs_consumer_resume(self._debug_name, rs_stream)
                 self._record_graph_wgrad_ring_slots_ready()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
@@ -1723,8 +1663,6 @@ class GTPShardedParam(torch.nn.Parameter):
                     for w in self._weights:
                         self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
-                    if runtime_hooks:
-                        runtime_planner.gtp_rs_finalize_end(self._debug_name, rs_stream)
         # Release stashed wgrad inputs: UNGRAPHED buffers go back to the pool;
         # GRAPHED just drops Python refs (addresses must stay stable for CG).
         if getattr(self, "_wgrad_input_bufs", None) is not None:
@@ -1759,9 +1697,18 @@ class GTPShardedParam(torch.nn.Parameter):
             torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
 
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
-        """Reduce-scatter wgrads and return outputs, work, and async planner token."""
+        """Reduce-scatter one or more wgrads → (outputs, handle). Single tensor: plain RS;
+        multiple: coalesced RS."""
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
+
+        runtime_profiler = get_gtp_runtime_profiler()
+        profile_active = runtime_profiler is not None and runtime_profiler.active
+        runtime_token = (
+            runtime_profiler.rs_ready(self._debug_name, torch.cuda.current_stream())
+            if profile_active
+            else None
+        )
 
         # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
         self._prescale_wgrads_for_mean_rs(wgrads)
@@ -1773,43 +1720,21 @@ class GTPShardedParam(torch.nn.Parameter):
 
         wgrads = self._prepare_wgrad_reduce_scatter_inputs(wgrads)
 
-        cache = None
         if async_op:
             dtypes = [w.dtype for w in wgrads]
             out_buffers = []
-            rs_tickets = []
             cache = get_global_GTP_cache()
             for p, dt in zip(self._weights, dtypes):
                 if p._rs_ticket is None:
                     p._rs_ticket = cache.reserve(p, dt, fwd=False, reduce_scatter=True)
-                rs_tickets.append(p._rs_ticket)
                 out_buffers.append(cache.get(p._rs_ticket))
         else:
-            rs_tickets = []
             out_buffers = [None] * len(wgrads)
-
-        runtime_planner = get_runtime_comm_planner()
-        runtime_token = None
-        if runtime_planner.hooks_enabled:
-            runtime_token = runtime_planner.gtp_rs_ready(
-                self._debug_name,
-                expert=self.is_routed_expert,
-                communicator_size=self.group.size(),
-                payload_bytes=_runtime_tensor_bytes(wgrads),
-                reusable_buffers=(
-                    tuple(cache.planner_buffer_spec(ticket) for ticket in rs_tickets)
-                    if cache is not None
-                    else ()
-                ),
-                stream=torch.cuda.current_stream(),
-            )
 
         # ASYNC RS: issue on rs_stream so its tail reflects the collective's full lifecycle
         # (what external wait_stream(rs_stream) drains depend on). The explicit outer→rs_stream
         # sync event preserves the wgrad-GEMM writer edge the bare stream context drops; held on
         # self so the event pool can't recycle it between capture and replay. Mirrors the AG path.
-        # Record planner readiness before this dependency event so the side-stream START
-        # timestamp is ordered after the READY timestamp.
         # SYNC RS: stay on caller — output ready on return.
         if async_op:
             outer_stream = torch.cuda.current_stream()
@@ -1824,8 +1749,10 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
-            if runtime_token is not None:
-                runtime_planner.collective_start(runtime_token, torch.cuda.current_stream())
+            if profile_active:
+                runtime_profiler.communication_start(
+                    runtime_token, torch.cuda.current_stream()
+                )
             if len(wgrads) == 1:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs")
                 out, handle = reduce_scatter_along_first_dim(
@@ -1846,17 +1773,12 @@ class GTPShardedParam(torch.nn.Parameter):
                         outputs.append(out)
                 nvtx_range_pop(f"{nvtx_label}.batched_gtp_rs")
                 handle = cm if async_op else None
-            if runtime_token is not None and not async_op:
-                runtime_planner.collective_end(runtime_token, torch.cuda.current_stream())
+            if profile_active:
+                runtime_profiler.communication_end(
+                    runtime_token, torch.cuda.current_stream()
+                )
 
-        if runtime_token is not None and async_op:
-            runtime_planner.collective_completion(
-                runtime_token,
-                _runtime_completion_work(handle),
-                keepalive=tuple([*wgrads, *outputs]),
-            )
-
-        return outputs, handle, runtime_token if async_op else None
+            return outputs, handle
 
     def _prepare_wgrad_reduce_scatter_inputs(self, wgrads):
         """Return alignment-padded RS inputs with stable ownership when ring-backed.
@@ -1911,33 +1833,15 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
-            _, rs_handle, runtime_token = self._reduce_scatter(
-                wgrads, async_op=True, nvtx_label=nvtx_label
-            )
-            self._wgrad_rs_handle = GTPShardHandle(
-                rs_handle,
-                weights,
-                reduce_scatter=True,
-                runtime_planner_token=runtime_token,
-            )
+            _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
+            self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
             # Stash wgrad input buffers — cannot recycle yet because the async RS
             # kernel is still reading them on rs_stream.
             self._wgrad_input_bufs = wgrads
             ret = tuple([None] * len(wgrads)) if batched else None
         else:
             # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately
-            wgrads, _, _ = self._reduce_scatter(
-                wgrads, async_op=False, nvtx_label=nvtx_label
-            )
-            runtime_planner = get_runtime_comm_planner()
-            runtime_hooks = runtime_planner.hooks_enabled
-            if runtime_hooks:
-                runtime_planner.gtp_rs_consumer_ready(
-                    self._debug_name, torch.cuda.current_stream()
-                )
-                runtime_planner.gtp_rs_consumer_resume(
-                    self._debug_name, torch.cuda.current_stream()
-                )
+            wgrads, _ = self._reduce_scatter(wgrads, async_op=False, nvtx_label=nvtx_label)
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
                 weights[0].main_grad.add_(wgrads[0])
@@ -1949,10 +1853,6 @@ class GTPShardedParam(torch.nn.Parameter):
             if poolable:
                 for buf in wgrads:
                     _wgrad_pool_put(buf)
-            if runtime_hooks:
-                runtime_planner.gtp_rs_finalize_end(
-                    self._debug_name, torch.cuda.current_stream()
-                )
             ret = result if batched else result[0]
 
         # Wait for last reduce scatter if it was async
@@ -1963,17 +1863,7 @@ class GTPShardedParam(torch.nn.Parameter):
             if getattr(self.next_w, "_already_finalized", False):
                 self.next_w._already_finalized = False
             else:
-                runtime_planner = get_runtime_comm_planner()
-                runtime_hooks = runtime_planner.hooks_enabled
-                if runtime_hooks:
-                    runtime_planner.gtp_rs_consumer_ready(
-                        self.next_w._debug_name, torch.cuda.current_stream()
-                    )
                 self.next_w.rs_event.wait()
-                if runtime_hooks:
-                    runtime_planner.gtp_rs_consumer_resume(
-                        self.next_w._debug_name, torch.cuda.current_stream()
-                    )
                 cache = get_global_GTP_cache()
                 next_weights = self.next_w._weights
                 wgrads = [cache.get(w._rs_ticket) for w in next_weights]
@@ -1987,10 +1877,6 @@ class GTPShardedParam(torch.nn.Parameter):
                 for w in next_weights:
                     self._handle_megatron_grad_accum(w)
                     cache.release(w._rs_ticket)
-                if runtime_hooks:
-                    runtime_planner.gtp_rs_finalize_end(
-                        self.next_w._debug_name, torch.cuda.current_stream()
-                    )
 
         return ret
 
@@ -2008,32 +1894,25 @@ class GTPShardedParam(torch.nn.Parameter):
     # ------------------------------------------------------------------
     def materialize_group_for_forward(self):
         """Protocol: all-gather the group's shard(s) for the forward GEMM."""
-        runtime_planner = get_runtime_comm_planner()
-        runtime_hooks = runtime_planner.hooks_enabled
-        if runtime_hooks:
-            direction = _runtime_gtp_direction(True)
-            runtime_planner.gtp_consumer_ready(
-                self._debug_name, direction, torch.cuda.current_stream()
-            )
         result = self.all_gather_and_prefetch(fwd=True)
-        if runtime_hooks:
-            runtime_planner.gtp_consumer_resume(
-                self._debug_name, direction, torch.cuda.current_stream()
+        runtime_profiler = get_gtp_runtime_profiler()
+        if runtime_profiler is not None and runtime_profiler.active:
+            runtime_profiler.compute_start(
+                self._debug_name,
+                _runtime_profile_phase(True),
+                torch.cuda.current_stream(),
             )
         return result
 
     def materialize_group_for_backward(self, nvtx_label=None):
         """Protocol: re-materialize the group's weight(s) for the backward GEMMs."""
-        runtime_planner = get_runtime_comm_planner()
-        runtime_hooks = runtime_planner.hooks_enabled
-        if runtime_hooks:
-            runtime_planner.gtp_consumer_ready(
-                self._debug_name, "backward", torch.cuda.current_stream()
-            )
         result = self.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
-        if runtime_hooks:
-            runtime_planner.gtp_consumer_resume(
-                self._debug_name, "backward", torch.cuda.current_stream()
+        runtime_profiler = get_gtp_runtime_profiler()
+        if runtime_profiler is not None and runtime_profiler.active:
+            runtime_profiler.compute_start(
+                self._debug_name,
+                GTPPhase.BACKWARD,
+                torch.cuda.current_stream(),
             )
         return result
 
@@ -2082,9 +1961,6 @@ class _TicketSlot:
     fwd: bool
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
-    planner_arena: str = ""
-    planner_slot: Optional[int] = None
-    planner_capacity_bytes: int = 0
 
 
 # CUDA-graph memory pool: routes GRAPHED-chain allocations (AG/RS buffers, quantized weight
@@ -2142,10 +2018,6 @@ class GTPWeightCache:
         self._slots: Dict[int, _TicketSlot] = {}
         self._next_ticket: int = 0
         self._total_bytes: int = 0  # running total of allocated bytes
-        self._planner_slots_by_buffer: Dict[tuple, int] = {}
-        self._planner_next_slot: Dict[str, int] = defaultdict(int)
-        self._planner_group_ordinals: Dict[tuple, int] = {}
-        self._planner_next_group_ordinal: Dict[tuple, int] = defaultdict(int)
         self.key_to_allocate_func = {}
 
     @staticmethod
@@ -2207,12 +2079,6 @@ class GTPWeightCache:
     def reserve(self, param: "GTPShardedParam", dtype, fwd: bool, reduce_scatter=False) -> int:
         """Assign a persistent ticket.  No buffer is allocated until ``get()``."""
         key = param._get_cache_key(dtype, fwd, reduce_scatter)
-        planner_arena = self._planner_arena(param, dtype, fwd, reduce_scatter)
-        out_shape = (
-            param._sharded_padded_shape
-            if reduce_scatter
-            else param._unsharded_shape_padded
-        )
         ticket = self._next_ticket
         self._next_ticket += 1
 
@@ -2223,8 +2089,6 @@ class GTPWeightCache:
             reduce_scatter=reduce_scatter,
             fwd=fwd,
             chain_id=getattr(param, "chain_id", GTPChain.UNGRAPHED.value),
-            planner_arena=planner_arena,
-            planner_capacity_bytes=self._buf_bytes(out_shape, dtype),
         )
         return ticket
 
@@ -2246,29 +2110,8 @@ class GTPWeightCache:
                 slot.reduce_scatter,
                 slot.fwd,
             )
-        if slot.planner_slot is None:
-            identity = (slot.planner_arena, id(slot.buf))
-            planner_slot = self._planner_slots_by_buffer.get(identity)
-            if planner_slot is None:
-                planner_slot = self._planner_next_slot[slot.planner_arena]
-                self._planner_next_slot[slot.planner_arena] += 1
-                self._planner_slots_by_buffer[identity] = planner_slot
-            slot.planner_slot = planner_slot
 
         return slot.buf
-
-    def planner_buffer_spec(self, ticket: int) -> tuple[str, int, int, int]:
-        """Return rank-stable logical metadata for a checked-out cache ticket."""
-
-        slot = self._slots[ticket]
-        if slot.buf is None or slot.planner_slot is None:
-            raise RuntimeError("GTP planner buffer metadata requires a checked-out ticket")
-        return (
-            slot.planner_arena,
-            slot.planner_slot,
-            slot.planner_capacity_bytes,
-            0,
-        )
 
     def release(self, ticket: int):
         """Release a reusable buffer to the pool while keeping its ticket valid.
@@ -2292,45 +2135,8 @@ class GTPWeightCache:
         """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""
         for slot in self._slots.values():
             slot.buf = None
-            slot.planner_slot = None
         self._pool.clear()
-        self._planner_slots_by_buffer.clear()
-        self._planner_next_slot.clear()
-        self._planner_group_ordinals.clear()
-        self._planner_next_group_ordinal.clear()
         self._total_bytes = 0
-
-    def _planner_arena(self, param, dtype, fwd: bool, reduce_scatter: bool) -> str:
-        """Build a stable arena name matching the cache's physical alias domain."""
-
-        chain = getattr(param, "chain_id", GTPChain.UNGRAPHED.value)
-        domain = "expert_gtp" if getattr(param, "is_routed_expert", False) else "dense_gtp"
-        group_size = param.group.size()
-        group_key = (domain, group_size, id(param.group))
-        group_ordinal = self._planner_group_ordinals.get(group_key)
-        if group_ordinal is None:
-            ordinal_key = (domain, group_size)
-            group_ordinal = self._planner_next_group_ordinal[ordinal_key]
-            self._planner_next_group_ordinal[ordinal_key] += 1
-            self._planner_group_ordinals[group_key] = group_ordinal
-        shape = (
-            param._sharded_padded_shape
-            if reduce_scatter
-            else param._unsharded_shape_padded
-        )
-        shape_key = "x".join(str(dim) for dim in shape)
-        dtype_key = getattr(dtype, "name", str(dtype)).replace(" ", "_")
-        expert_index = getattr(param, "expert_idx", None)
-        direction_key = (
-            f":fwd{int(fwd)}"
-            if not isinstance(dtype, torch.dtype)
-            else ""
-        )
-        return (
-            f"gtp_cache:{chain}:{domain}:size{group_size}:group{group_ordinal}:"
-            f"{shape_key}:{dtype_key}:expert{expert_index}:rs{int(reduce_scatter)}"
-            f"{direction_key}"
-        )
 
 
 def get_global_GTP_cache() -> GTPWeightCache:
@@ -2404,17 +2210,7 @@ def wait_async_comms(
             )
             if need_fallback_accumulation:
                 cache = get_global_GTP_cache()
-                runtime_planner = get_runtime_comm_planner()
-                runtime_hooks = runtime_planner.hooks_enabled
-                if runtime_hooks:
-                    runtime_planner.gtp_rs_consumer_ready(
-                        param._debug_name, torch.cuda.current_stream()
-                    )
                 param.rs_event.wait()
-                if runtime_hooks:
-                    runtime_planner.gtp_rs_consumer_resume(
-                        param._debug_name, torch.cuda.current_stream()
-                    )
                 for w in param._weights:
                     w._set_rs_state(GTPWeightState.NONE)
                     wgrad_rs = cache.get(w._rs_ticket)
@@ -2423,10 +2219,6 @@ def wait_async_comms(
                     if hasattr(w, "grad_added_to_main_grad"):
                         w.grad_added_to_main_grad = True
                 param._already_finalized = True
-                if runtime_hooks:
-                    runtime_planner.gtp_rs_finalize_end(
-                        param._debug_name, torch.cuda.current_stream()
-                    )
 
 
 @dataclass
@@ -2517,13 +2309,13 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def forward(ctx, weight):
         """All-gather the full embedding weight across the GTP group for the lookup."""
         ctx.save_for_backward(weight)
-        return weight.materialize_group_for_forward()
+        return weight.all_gather_and_prefetch(fwd=True)
 
     @staticmethod
     def backward(ctx, grad_output):
         """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
-        return weight.finalize_group_grads(grad_output)
+        return weight.wgrad_reduce_scatter(grad_output)
 
 
 def reset_gtp_state():

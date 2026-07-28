@@ -1,86 +1,39 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Runtime communication graph, profiling, and planning primitives.
+"""Compact CUDA profiling and execution modeling for GTP communication plans."""
 
-The package is intentionally independent from GTP launch code. The first
-version supports shadow profiling and deterministic plan compilation; a later
-integration can execute the plan from GTP and EP semantic hook sites.
-"""
-
-from .graph import (
-    Dependency,
-    DependencyKind,
-    OperationGraph,
-    OperationGraphBuilder,
-    OperationKind,
-    OperationSpec,
-    Phase,
-    ReusableBufferSpec,
-    SemanticOpId,
-    SymmetricBufferSpec,
-    Trigger,
-    TriggerKind,
+from .model import (
+    GTPCudaSample,
+    GTPDependency,
+    GTPExecutionModel,
+    GTPPhase,
+    GTPProfileKey,
+    GTPTimingStatistics,
+    GTPWorkKind,
 )
-from .planner import (
-    DeadlineMiss,
-    PlanDiagnostics,
-    PlannerConfig,
-    RuntimeCommunicationPlanner,
-    RuntimePlan,
-    RuntimePlanExecutor,
-    ScheduledAction,
-)
-from .session import RuntimePlanningSession
 from .runtime import (
-    RuntimeCollectiveToken,
-    RuntimeCommunicationPlannerRuntime,
-    RuntimePlannerConfig,
-    RuntimePlannerMode,
-    configure_runtime_comm_planner,
-    get_runtime_comm_planner,
-    reset_runtime_comm_planner,
-)
-from .telemetry import (
-    CudaEventRecorder,
-    MissingTelemetryError,
-    OperationSample,
-    OperationStatistics,
-    TelemetryStore,
-    TimelineMarker,
+    GTPCudaEventRecorder,
+    GTPProfileToken,
+    GTPRuntimeProfileConfig,
+    GTPRuntimeProfiler,
+    configure_gtp_runtime_profiler,
+    get_gtp_runtime_profiler,
+    reset_gtp_runtime_profiler,
 )
 
 __all__ = [
-    "Dependency",
-    "DependencyKind",
-    "OperationGraph",
-    "OperationGraphBuilder",
-    "OperationKind",
-    "OperationSpec",
-    "Phase",
-    "ReusableBufferSpec",
-    "SemanticOpId",
-    "SymmetricBufferSpec",
-    "Trigger",
-    "TriggerKind",
-    "CudaEventRecorder",
-    "MissingTelemetryError",
-    "OperationSample",
-    "OperationStatistics",
-    "TelemetryStore",
-    "TimelineMarker",
-    "DeadlineMiss",
-    "PlanDiagnostics",
-    "PlannerConfig",
-    "RuntimeCommunicationPlanner",
-    "RuntimePlan",
-    "RuntimePlanExecutor",
-    "ScheduledAction",
-    "RuntimePlanningSession",
-    "RuntimeCollectiveToken",
-    "RuntimeCommunicationPlannerRuntime",
-    "RuntimePlannerConfig",
-    "RuntimePlannerMode",
-    "configure_runtime_comm_planner",
-    "get_runtime_comm_planner",
-    "reset_runtime_comm_planner",
+    "GTPCudaEventRecorder",
+    "GTPCudaSample",
+    "GTPDependency",
+    "GTPExecutionModel",
+    "GTPPhase",
+    "GTPProfileKey",
+    "GTPProfileToken",
+    "GTPRuntimeProfileConfig",
+    "GTPRuntimeProfiler",
+    "GTPTimingStatistics",
+    "GTPWorkKind",
+    "configure_gtp_runtime_profiler",
+    "get_gtp_runtime_profiler",
+    "reset_gtp_runtime_profiler",
 ]
