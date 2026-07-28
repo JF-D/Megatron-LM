@@ -23,6 +23,7 @@ from .graph import (
     OperationGraph,
     OperationKind,
     OperationSpec,
+    ReusableBufferSpec,
     SemanticOpId,
     SymmetricBufferSpec,
     Trigger,
@@ -96,6 +97,7 @@ class ScheduledAction:
     communicator_id: str | None
     sequence: int | None
     symmetric_buffer: SymmetricBufferSpec | None
+    reusable_buffers: tuple[ReusableBufferSpec, ...]
     buffer_release_us: float
     priority: int
 
@@ -175,6 +177,15 @@ class RuntimePlan:
                     "resources": sorted(action.resources),
                     "communicator": action.communicator_id,
                     "sequence": action.sequence,
+                    "reusable_buffers": [
+                        {
+                            "arena": buffer.arena,
+                            "slot": buffer.slot,
+                            "capacity_bytes": buffer.capacity_bytes,
+                            "generation": buffer.generation,
+                        }
+                        for buffer in action.reusable_buffers
+                    ],
                     "buffer_release_us": round(action.buffer_release_us, 6),
                 }
                 for action in self.actions
@@ -201,7 +212,7 @@ class _ResourceCalendars:
         ready_us: float,
         duration_us: float,
         execution_resources: frozenset[str],
-        buffer_resource: str | None,
+        buffer_resources: frozenset[str],
         release_us: float,
     ) -> float:
         """Find the first interval free on every required resource."""
@@ -214,7 +225,7 @@ class _ResourceCalendars:
                 blocked_until = max(
                     blocked_until, self._first_conflict_end(resource, candidate, execution_end)
                 )
-            if buffer_resource is not None:
+            for buffer_resource in buffer_resources:
                 buffer_end = max(execution_end, release_us)
                 blocked_until = max(
                     blocked_until, self._first_conflict_end(buffer_resource, candidate, buffer_end)
@@ -230,14 +241,14 @@ class _ResourceCalendars:
         start_us: float,
         end_us: float,
         execution_resources: frozenset[str],
-        buffer_resource: str | None,
+        buffer_resources: frozenset[str],
         buffer_release_us: float,
     ) -> None:
         """Reserve execution and optional buffer-lifetime intervals."""
 
         for resource in execution_resources:
             self._insert(resource, _Reservation(start_us, end_us, op_id))
-        if buffer_resource is not None:
+        for buffer_resource in buffer_resources:
             self._insert(
                 buffer_resource, _Reservation(start_us, max(end_us, buffer_release_us), op_id)
             )
@@ -271,7 +282,7 @@ class _PlanningJob:
     deadline_us: float
     release_us: float
     execution_resources: frozenset[str]
-    buffer_resource: str | None
+    buffer_resources: frozenset[str]
 
 
 class RuntimeCommunicationPlanner:
@@ -349,10 +360,18 @@ class RuntimeCommunicationPlanner:
                 deadline_us=max(0.0, deadline_us),
                 release_us=max(ready_us, release_us),
                 execution_resources=frozenset(execution_resources),
-                buffer_resource=(
-                    spec.symmetric_buffer.resource_key
-                    if spec.symmetric_buffer is not None
-                    else None
+                buffer_resources=frozenset(
+                    [
+                        *(
+                            [spec.symmetric_buffer.resource_key]
+                            if spec.symmetric_buffer is not None
+                            else []
+                        ),
+                        *(
+                            buffer.resource_key
+                            for buffer in spec.reusable_buffers
+                        ),
+                    ]
                 ),
             )
         return jobs
@@ -394,7 +413,7 @@ class RuntimeCommunicationPlanner:
                 ready_us=earliest,
                 duration_us=job.duration_us,
                 execution_resources=job.execution_resources,
-                buffer_resource=job.buffer_resource,
+                buffer_resources=job.buffer_resources,
                 release_us=job.release_us,
             )
             end_us = start_us + job.duration_us
@@ -404,7 +423,7 @@ class RuntimeCommunicationPlanner:
                 start_us=start_us,
                 end_us=end_us,
                 execution_resources=job.execution_resources,
-                buffer_resource=job.buffer_resource,
+                buffer_resources=job.buffer_resources,
                 buffer_release_us=buffer_release_us,
             )
             starts[op_id] = start_us
@@ -437,7 +456,7 @@ class RuntimeCommunicationPlanner:
 
         # Preserve the resource order selected by the forward list scheduler.
         for resource, reservations in calendars.calendars.items():
-            if resource.startswith("symmetric_buffer:"):
+            if resource.startswith(("symmetric_buffer:", "reusable_buffer:")):
                 continue
             ordered = [reservation.op_id for reservation in reservations]
             for previous, current in zip(ordered, ordered[1:]):
@@ -490,6 +509,7 @@ class RuntimeCommunicationPlanner:
                     communicator_id=job.spec.communicator_id,
                     sequence=job.spec.sequence,
                     symmetric_buffer=job.spec.symmetric_buffer,
+                    reusable_buffers=job.spec.reusable_buffers,
                     buffer_release_us=max(end_us, job.release_us),
                     priority=job.spec.priority,
                 )
@@ -516,7 +536,7 @@ class RuntimeCommunicationPlanner:
 
         for resource, reservations in calendars.calendars.items():
             for previous, current in zip(reservations, reservations[1:]):
-                if resource.startswith("symmetric_buffer:"):
+                if resource.startswith(("symmetric_buffer:", "reusable_buffer:")):
                     previous_release = jobs[previous.op_id].spec.release_trigger
                     guards[current.op_id].add(previous_release or Trigger.op_end(previous.op_id))
                 else:
@@ -542,6 +562,11 @@ class RuntimeCommunicationPlanner:
             if spec.kind.is_communication:
                 times[start_trigger] = starts[op_id]
                 times[end_trigger] = starts[op_id] + jobs[op_id].duration_us
+                consumer_ready_trigger = Trigger.consumer_ready(op_id)
+                if spec.deadline_trigger == consumer_ready_trigger:
+                    times[consumer_ready_trigger] = telemetry.estimate_trigger(
+                        consumer_ready_trigger, self.config.trigger_percentile
+                    )
             else:
                 times[start_trigger] = telemetry.estimate_trigger(
                     start_trigger, self.config.trigger_percentile

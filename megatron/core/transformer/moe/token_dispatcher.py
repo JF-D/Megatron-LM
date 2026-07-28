@@ -1014,6 +1014,7 @@ class _HybridEPManager(_DispatchManager):
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
         self.config = config
+        self.runtime_comm_planner_scope = ""
         self.permute_fusion = config.moe_permute_fusion
         self.capacity_factor = config.moe_expert_capacity_factor
         # Drop and pad the input to capacity.
@@ -1141,6 +1142,7 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
                 fused=self.config.moe_permute_fusion_into_hybridep,
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
+                runtime_comm_planner_scope=self.runtime_comm_planner_scope,
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
@@ -1171,6 +1173,8 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
             fused=self.config.moe_permute_fusion_into_hybridep,
+            group=self.group,
+            runtime_comm_planner_scope=self.runtime_comm_planner_scope,
         )
         if (
             self._padded_num_tokens is not None

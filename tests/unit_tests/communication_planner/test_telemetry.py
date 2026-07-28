@@ -26,16 +26,18 @@ def test_operation_sample_separates_service_queue_wait_and_lifetime():
         iteration=3,
         ready_us=100.0,
         start_us=120.0,
-        end_us=220.0,
+        end_us=200.0,
+        drain_us=220.0,
         consumer_ready_us=200.0,
         consumer_resume_us=220.0,
         release_us=300.0,
     )
 
-    assert sample.service_us == 100.0
+    assert sample.service_us == 80.0
     assert sample.queue_delay_us == 20.0
+    assert sample.drain_delay_us == 20.0
     assert sample.exposed_wait_us == 20.0
-    assert sample.deadline_slack_us == -20.0
+    assert sample.deadline_slack_us == 0.0
     assert sample.lifetime_us == 180.0
 
 
@@ -64,7 +66,14 @@ def test_store_estimates_triggers_durations_and_overlap_context():
     stored = store.add_iteration(
         [
             OperationSample(op_id=ep, iteration=0, start_us=0.0, end_us=1000.0),
-            OperationSample(op_id=ag, iteration=0, start_us=200.0, end_us=1400.0),
+            OperationSample(
+                op_id=ag,
+                iteration=0,
+                start_us=200.0,
+                end_us=1400.0,
+                consumer_ready_us=1200.0,
+                consumer_resume_us=1400.0,
+            ),
         ],
         graph,
     )
@@ -75,7 +84,25 @@ def test_store_estimates_triggers_durations_and_overlap_context():
     assert store.estimate_duration(ag) == 1200.0
     assert store.estimate_trigger(Trigger.op_start(ag)) == 200.0
     assert store.estimate_trigger(Trigger.op_end(ag)) == 1400.0
+    assert store.estimate_trigger(Trigger.consumer_ready(ag)) == 1200.0
     assert store.estimate_iteration_end() == 1400.0
+
+
+def test_merge_rank_samples_is_deterministic_and_preserves_each_rank():
+    op_id = _id("L10", "ag")
+    rank0 = (
+        OperationSample(op_id=op_id, iteration=4, start_us=100.0, end_us=300.0),
+    )
+    rank1 = (
+        OperationSample(op_id=op_id, iteration=4, start_us=120.0, end_us=420.0),
+    )
+
+    merged = TelemetryStore.merge_rank_samples({1: rank1, 0: rank0})
+
+    samples = merged.samples(op_id)
+    assert [sample.iteration for sample in samples] == [0, 1]
+    assert [sample.service_us for sample in samples] == [200.0, 300.0]
+    assert merged.estimate_duration(op_id, 0.95) == pytest.approx(295.0)
 
 
 class _FakeStream:
@@ -111,7 +138,8 @@ def test_cuda_recorder_collects_completed_iterations_without_sync():
     recorder.begin_iteration(4, _FakeStream(10.0))
     recorder.record(op_id, TimelineMarker.READY, _FakeStream(10.2))
     recorder.record(op_id, TimelineMarker.START, _FakeStream(10.4))
-    recorder.record(op_id, TimelineMarker.END, _FakeStream(11.6))
+    recorder.record(op_id, TimelineMarker.END, _FakeStream(11.4))
+    recorder.record(op_id, TimelineMarker.DRAIN, _FakeStream(11.6))
     recorder.record(op_id, TimelineMarker.CONSUMER_READY, _FakeStream(11.5))
     recorder.record(op_id, TimelineMarker.CONSUMER_RESUME, _FakeStream(11.6))
     recorder.end_iteration(_FakeStream(12.0))
@@ -128,5 +156,36 @@ def test_cuda_recorder_collects_completed_iterations_without_sync():
     assert iteration == 4
     assert samples[0].ready_us == pytest.approx(200.0)
     assert samples[0].start_us == pytest.approx(400.0)
-    assert samples[0].end_us == pytest.approx(1600.0)
+    assert samples[0].end_us == pytest.approx(1400.0)
+    assert samples[0].drain_us == pytest.approx(1600.0)
+    assert samples[0].drain_delay_us == pytest.approx(200.0)
     assert samples[0].exposed_wait_us == pytest.approx(100.0)
+
+
+def test_cuda_recorder_accepts_production_drain_before_completion_probe():
+    op_id = _id("L10", "ag")
+    recorder = CudaEventRecorder(_FakeEvent)
+
+    recorder.begin_iteration(4, _FakeStream(10.0))
+    recorder.record(op_id, TimelineMarker.START, _FakeStream(10.2))
+    recorder.record(op_id, TimelineMarker.END, _FakeStream(10.9))
+    recorder.record(op_id, TimelineMarker.DRAIN, _FakeStream(10.8))
+    recorder.end_iteration(_FakeStream(11.0))
+
+    _, samples = recorder.collect_completed()[0]
+    assert samples[0].end_us == pytest.approx(800.0)
+    assert samples[0].drain_us == pytest.approx(800.0)
+    assert samples[0].drain_delay_us == pytest.approx(0.0)
+
+
+def test_operation_sample_reports_cross_stream_marker_order():
+    op_id = _id("L10", "ag")
+
+    with pytest.raises(ValueError, match=rf"{op_id.stable_key}.*ready_us=400.0.*start_us=200.0"):
+        OperationSample(
+            op_id=op_id,
+            iteration=0,
+            ready_us=400.0,
+            start_us=200.0,
+            end_us=800.0,
+        )

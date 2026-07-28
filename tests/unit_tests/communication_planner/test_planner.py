@@ -6,6 +6,7 @@ from megatron.core.communication_planner import (
     OperationSample,
     OperationSpec,
     Phase,
+    ReusableBufferSpec,
     RuntimeCommunicationPlanner,
     RuntimePlanExecutor,
     SemanticOpId,
@@ -237,6 +238,49 @@ def test_planner_reserves_symmetric_buffer_until_consumer_release():
     by_id = {action.op_id: action for action in plan.actions}
     assert by_id[ag_a].buffer_release_us == 1500.0
     assert by_id[ag_b].planned_start_us >= by_id[ag_a].buffer_release_us
+
+
+def test_planner_reserves_reusable_buffer_until_consumer_release():
+    consumer_a = _id("A", "consumer", Phase.FORWARD)
+    consumer_b = _id("B", "consumer", Phase.FORWARD)
+    ag_a = _id("A", "ag", Phase.FORWARD)
+    ag_b = _id("B", "ag", Phase.FORWARD)
+    slot = ReusableBufferSpec(arena="gtp_cache", slot=0, capacity_bytes=4096)
+    builder = OperationGraphBuilder()
+    for consumer in (consumer_a, consumer_b):
+        builder.add_operation(OperationSpec(op_id=consumer, kind=OperationKind.COMPUTE))
+    for ag, consumer, rail in (
+        (ag_a, consumer_a, "rail0"),
+        (ag_b, consumer_b, "rail1"),
+    ):
+        builder.add_operation(
+            OperationSpec(
+                op_id=ag,
+                kind=OperationKind.GTP_DENSE_AG,
+                ready_trigger=Trigger.window_start(Phase.FORWARD),
+                deadline_trigger=Trigger.op_start(consumer),
+                release_trigger=Trigger.op_end(consumer),
+                resources=frozenset({rail}),
+                reusable_buffers=(slot,),
+            )
+        )
+    graph = builder.build()
+    telemetry = TelemetryStore()
+    telemetry.add_iteration(
+        [
+            OperationSample(op_id=consumer_a, iteration=0, start_us=1000.0, end_us=1500.0),
+            OperationSample(op_id=consumer_b, iteration=0, start_us=3000.0, end_us=3500.0),
+            OperationSample(op_id=ag_a, iteration=0, start_us=0.0, end_us=500.0),
+            OperationSample(op_id=ag_b, iteration=0, start_us=1500.0, end_us=2000.0),
+        ],
+        graph,
+    )
+
+    plan = RuntimeCommunicationPlanner().compile(graph, telemetry, epoch=0)
+    by_id = {action.op_id: action for action in plan.actions}
+    assert by_id[ag_a].buffer_release_us == 1500.0
+    assert by_id[ag_b].planned_start_us >= by_id[ag_a].buffer_release_us
+    assert by_id[ag_a].reusable_buffers == (slot,)
 
 
 def test_executor_fires_each_action_once():

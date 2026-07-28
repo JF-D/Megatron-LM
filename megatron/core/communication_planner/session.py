@@ -81,6 +81,22 @@ class RuntimePlanningSession:
 
         self.recorder.record(op_id, marker, stream)
 
+    def alias_marker(
+        self,
+        op_id: SemanticOpId,
+        marker: TimelineMarker,
+        source_op_id: SemanticOpId,
+        source_marker: TimelineMarker,
+    ) -> None:
+        """Reuse an earlier operation marker as a semantic trigger timestamp."""
+
+        self.recorder.alias_marker(op_id, marker, source_op_id, source_marker)
+
+    def alias_origin(self, op_id: SemanticOpId, marker: TimelineMarker) -> None:
+        """Use the iteration origin as a semantic trigger timestamp."""
+
+        self.recorder.alias_origin(op_id, marker)
+
     def end_iteration(self, stream: object | None = None) -> None:
         """Close the current eager iteration."""
 

@@ -8,6 +8,7 @@ from megatron.core.communication_planner import (
     OperationKind,
     OperationSpec,
     Phase,
+    ReusableBufferSpec,
     SemanticOpId,
     Trigger,
 )
@@ -73,6 +74,32 @@ def test_graph_fingerprint_is_independent_of_registration_order():
     assert first.topological_order() == second.topological_order()
 
 
+def test_consumer_ready_deadline_keeps_explicit_data_dependency():
+    producer = _id("L10", "producer")
+    consumer = _id("L10", "consumer")
+    ag = _id("L10", "ag")
+    builder = OperationGraphBuilder()
+    builder.add_operation(OperationSpec(op_id=producer, kind=OperationKind.COMPUTE))
+    builder.add_operation(OperationSpec(op_id=consumer, kind=OperationKind.COMPUTE))
+    builder.add_operation(
+        OperationSpec(
+            op_id=ag,
+            kind=OperationKind.GTP_DENSE_AG,
+            ready_trigger=Trigger.op_end(producer),
+            deadline_trigger=Trigger.consumer_ready(ag),
+            release_trigger=Trigger.op_end(consumer),
+        )
+    )
+    builder.add_dependency(ag, consumer)
+
+    graph = builder.build()
+    dependencies = {(edge.src, edge.dst, edge.kind) for edge in graph.dependencies}
+
+    assert (producer, ag, DependencyKind.DATA) in dependencies
+    assert (ag, consumer, DependencyKind.DATA) in dependencies
+    assert all(edge.src != edge.dst for edge in graph.dependencies)
+
+
 def test_builder_rejects_cycles():
     left = _id("L10", "left")
     right = _id("L10", "right")
@@ -103,3 +130,34 @@ def test_builder_rejects_duplicate_communicator_sequence():
 
     with pytest.raises(ValueError, match="Duplicate sequence"):
         builder.build()
+
+
+def test_reusable_buffer_requires_release_trigger_and_changes_fingerprint():
+    op_id = _id("L10", "ag")
+    first_slot = ReusableBufferSpec(arena="gtp_cache", slot=0, capacity_bytes=4096)
+    second_slot = ReusableBufferSpec(arena="gtp_cache", slot=1, capacity_bytes=4096)
+
+    with pytest.raises(ValueError, match="requires a release_trigger"):
+        OperationSpec(
+            op_id=op_id,
+            kind=OperationKind.GTP_DENSE_AG,
+            ready_trigger=Trigger.window_start(Phase.FORWARD),
+            reusable_buffers=(first_slot,),
+        )
+
+    def build(slot):
+        return (
+            OperationGraphBuilder()
+            .add_operation(
+                OperationSpec(
+                    op_id=op_id,
+                    kind=OperationKind.GTP_DENSE_AG,
+                    ready_trigger=Trigger.window_start(Phase.FORWARD),
+                    release_trigger=Trigger.consumer_ready(op_id),
+                    reusable_buffers=(slot,),
+                )
+            )
+            .build()
+        )
+
+    assert build(first_slot).fingerprint != build(second_slot).fingerprint

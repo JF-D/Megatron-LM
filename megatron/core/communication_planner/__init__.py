@@ -15,6 +15,7 @@ from .graph import (
     OperationKind,
     OperationSpec,
     Phase,
+    ReusableBufferSpec,
     SemanticOpId,
     SymmetricBufferSpec,
     Trigger,
@@ -30,6 +31,15 @@ from .planner import (
     ScheduledAction,
 )
 from .session import RuntimePlanningSession
+from .runtime import (
+    RuntimeCollectiveToken,
+    RuntimeCommunicationPlannerRuntime,
+    RuntimePlannerConfig,
+    RuntimePlannerMode,
+    configure_runtime_comm_planner,
+    get_runtime_comm_planner,
+    reset_runtime_comm_planner,
+)
 from .telemetry import (
     CudaEventRecorder,
     MissingTelemetryError,
@@ -47,6 +57,7 @@ __all__ = [
     "OperationKind",
     "OperationSpec",
     "Phase",
+    "ReusableBufferSpec",
     "SemanticOpId",
     "SymmetricBufferSpec",
     "Trigger",
@@ -65,4 +76,11 @@ __all__ = [
     "RuntimePlanExecutor",
     "ScheduledAction",
     "RuntimePlanningSession",
+    "RuntimeCollectiveToken",
+    "RuntimeCommunicationPlannerRuntime",
+    "RuntimePlannerConfig",
+    "RuntimePlannerMode",
+    "configure_runtime_comm_planner",
+    "get_runtime_comm_planner",
+    "reset_runtime_comm_planner",
 ]

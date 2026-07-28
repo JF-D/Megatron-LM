@@ -53,6 +53,7 @@ class TriggerKind(str, Enum):
     WINDOW_START = "window_start"
     OP_START = "op_start"
     OP_END = "op_end"
+    OP_CONSUMER_READY = "op_consumer_ready"
 
 
 class DependencyKind(str, Enum):
@@ -112,7 +113,8 @@ class Trigger:
     """Semantic runtime trigger.
 
     Window-start triggers have no ``op_id``. Operation triggers fire at the
-    start or end of the referenced logical operation.
+    start, end, or natural consumer-ready point of the referenced logical
+    operation.
     """
 
     kind: TriggerKind
@@ -154,6 +156,17 @@ class Trigger:
             kind=TriggerKind.OP_END, phase=op_id.phase, microbatch=op_id.microbatch, op_id=op_id
         )
 
+    @classmethod
+    def consumer_ready(cls, op_id: SemanticOpId) -> Trigger:
+        """Create a trigger for the point where an operation's consumer needs its output."""
+
+        return cls(
+            kind=TriggerKind.OP_CONSUMER_READY,
+            phase=op_id.phase,
+            microbatch=op_id.microbatch,
+            op_id=op_id,
+        )
+
     @property
     def stable_key(self) -> str:
         """Deterministic trigger key used in serialized plans."""
@@ -188,6 +201,28 @@ class SymmetricBufferSpec:
 
 
 @dataclass(frozen=True)
+class ReusableBufferSpec:
+    """Stable logical slot in a non-symmetric reusable buffer arena."""
+
+    arena: str
+    slot: int
+    capacity_bytes: int
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.arena:
+            raise ValueError("ReusableBufferSpec.arena must be non-empty")
+        if min(self.slot, self.capacity_bytes, self.generation) < 0:
+            raise ValueError("Reusable buffer fields must be non-negative")
+
+    @property
+    def resource_key(self) -> str:
+        """Resource identifier used to prevent unsafe slot reuse."""
+
+        return f"reusable_buffer:{self.arena}:{self.slot}"
+
+
+@dataclass(frozen=True)
 class OperationSpec:
     """Description of one logical compute or communication operation.
 
@@ -204,6 +239,7 @@ class OperationSpec:
         deadline_trigger: Consumer point by which communication should finish.
         release_trigger: Point after which an output/symmetric buffer may be reused.
         symmetric_buffer: Optional symmetric-memory placement.
+        reusable_buffers: Stable ordinary cache slots used by this operation.
         priority: Tie breaker; smaller values have higher priority.
     """
 
@@ -217,6 +253,7 @@ class OperationSpec:
     deadline_trigger: Trigger | None = None
     release_trigger: Trigger | None = None
     symmetric_buffer: SymmetricBufferSpec | None = None
+    reusable_buffers: tuple[ReusableBufferSpec, ...] = ()
     priority: int = 0
 
     def __post_init__(self) -> None:
@@ -228,6 +265,13 @@ class OperationSpec:
             raise ValueError("communicator_id and sequence must be specified together")
         if self.sequence is not None and self.sequence < 0:
             raise ValueError("OperationSpec.sequence must be non-negative")
+        reusable_keys = [buffer.resource_key for buffer in self.reusable_buffers]
+        if len(reusable_keys) != len(set(reusable_keys)):
+            raise ValueError("OperationSpec.reusable_buffers must be unique")
+        if (
+            self.symmetric_buffer is not None or self.reusable_buffers
+        ) and self.release_trigger is None:
+            raise ValueError("Buffered communication requires a release_trigger")
         if self.kind.is_communication and self.ready_trigger is None:
             raise ValueError("Communication operations require a ready_trigger")
         if not self.kind.is_communication:
@@ -239,7 +283,11 @@ class OperationSpec:
                 self.release_trigger,
                 self.symmetric_buffer,
             )
-            if any(value is not None for value in disallowed) or self.bytes:
+            if (
+                any(value is not None for value in disallowed)
+                or self.reusable_buffers
+                or self.bytes
+            ):
                 raise ValueError("Compute operations cannot carry communication-only fields")
 
 
@@ -354,6 +402,15 @@ class OperationGraph:
                         if buffer is not None
                         else None
                     ),
+                    "reusable_buffers": [
+                        {
+                            "arena": buffer.arena,
+                            "slot": buffer.slot,
+                            "capacity": buffer.capacity_bytes,
+                            "generation": buffer.generation,
+                        }
+                        for buffer in spec.reusable_buffers
+                    ],
                     "priority": spec.priority,
                 }
             )

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 
@@ -28,6 +28,7 @@ class TimelineMarker(str, Enum):
     READY = "ready"
     START = "start"
     END = "end"
+    DRAIN = "drain"
     CONSUMER_READY = "consumer_ready"
     CONSUMER_RESUME = "consumer_resume"
     RELEASE = "release"
@@ -47,6 +48,7 @@ class OperationSample:
     start_us: float
     end_us: float
     ready_us: float | None = None
+    drain_us: float | None = None
     consumer_ready_us: float | None = None
     consumer_resume_us: float | None = None
     release_us: float | None = None
@@ -57,6 +59,7 @@ class OperationSample:
             self.start_us,
             self.end_us,
             self.ready_us,
+            self.drain_us,
             self.consumer_ready_us,
             self.consumer_resume_us,
             self.release_us,
@@ -66,9 +69,17 @@ class OperationSample:
         if self.iteration < 0:
             raise ValueError("OperationSample.iteration must be non-negative")
         if self.end_us < self.start_us:
-            raise ValueError("OperationSample.end_us must not precede start_us")
+            raise ValueError(
+                f"OperationSample.end_us must not precede start_us for "
+                f"{self.op_id.stable_key}: start_us={self.start_us}, end_us={self.end_us}"
+            )
         if self.ready_us is not None and self.start_us < self.ready_us:
-            raise ValueError("OperationSample.start_us must not precede ready_us")
+            raise ValueError(
+                f"OperationSample.start_us must not precede ready_us for "
+                f"{self.op_id.stable_key}: ready_us={self.ready_us}, start_us={self.start_us}"
+            )
+        if self.drain_us is not None and self.drain_us < self.end_us:
+            raise ValueError("drain_us must not precede end_us")
         if (
             self.consumer_ready_us is not None
             and self.consumer_resume_us is not None
@@ -89,6 +100,12 @@ class OperationSample:
         """Delay from data readiness to device execution."""
 
         return self.start_us - self.ready_us if self.ready_us is not None else None
+
+    @property
+    def drain_delay_us(self) -> float | None:
+        """Time from device completion until the production stream drains the work."""
+
+        return self.drain_us - self.end_us if self.drain_us is not None else None
 
     @property
     def exposed_wait_us(self) -> float | None:
@@ -187,7 +204,12 @@ class TelemetryStore:
             max(
                 max(
                     value
-                    for value in (sample.end_us, sample.consumer_resume_us, sample.release_us)
+                    for value in (
+                        sample.end_us,
+                        sample.drain_us,
+                        sample.consumer_resume_us,
+                        sample.release_us,
+                    )
                     if value is not None
                 )
                 for sample in items
@@ -199,6 +221,60 @@ class TelemetryStore:
         """Return retained samples for one operation."""
 
         return tuple(self._samples.get(op_id, ()))
+
+    def all_samples(self) -> tuple[OperationSample, ...]:
+        """Return every retained sample in deterministic semantic order."""
+
+        return tuple(
+            sample
+            for op_id in sorted(self._samples, key=lambda item: item.stable_key)
+            for sample in sorted(
+                self._samples[op_id],
+                key=lambda item: (item.iteration, item.start_us, item.end_us),
+            )
+        )
+
+    @classmethod
+    def merge_rank_samples(
+        cls, rank_samples: Mapping[int, Iterable[OperationSample]]
+    ) -> TelemetryStore:
+        """Merge rank-local timelines into one deterministic planning store.
+
+        Original iteration numbers repeat on every rank. The merged store
+        assigns a stable synthetic iteration to each ``(rank, iteration)``
+        pair, preserving all samples without conflating observations from
+        different participants.
+        """
+
+        grouped: dict[int, dict[int, list[OperationSample]]] = {}
+        iteration_count = 0
+        for rank, samples in rank_samples.items():
+            if rank < 0:
+                raise ValueError("Telemetry rank must be non-negative")
+            rank_iterations: dict[int, list[OperationSample]] = defaultdict(list)
+            for sample in samples:
+                rank_iterations[sample.iteration].append(sample)
+            grouped[rank] = rank_iterations
+            iteration_count += len(rank_iterations)
+
+        if iteration_count == 0:
+            raise MissingTelemetryError("No rank telemetry samples are available")
+
+        merged = cls(max_samples_per_operation=iteration_count)
+        merged_iteration = 0
+        for rank in sorted(grouped):
+            for iteration in sorted(grouped[rank]):
+                samples = sorted(
+                    grouped[rank][iteration], key=lambda item: item.op_id.stable_key
+                )
+                merged.add_iteration(
+                    (
+                        replace(sample, iteration=merged_iteration)
+                        for sample in samples
+                    )
+                )
+                merged_iteration += 1
+        return merged
 
     def estimate_duration(
         self,
@@ -225,11 +301,22 @@ class TelemetryStore:
         samples = self.samples(trigger.op_id)
         if not samples:
             raise MissingTelemetryError(f"No trigger samples for {trigger.op_id}")
-        values = (
-            (sample.start_us for sample in samples)
-            if trigger.kind is TriggerKind.OP_START
-            else (sample.end_us for sample in samples)
-        )
+        if trigger.kind is TriggerKind.OP_START:
+            values = (sample.start_us for sample in samples)
+        elif trigger.kind is TriggerKind.OP_END:
+            values = (sample.end_us for sample in samples)
+        else:
+            assert trigger.kind is TriggerKind.OP_CONSUMER_READY
+            consumer_ready = tuple(
+                sample.consumer_ready_us
+                for sample in samples
+                if sample.consumer_ready_us is not None
+            )
+            if len(consumer_ready) != len(samples):
+                raise MissingTelemetryError(
+                    f"Missing consumer-ready samples for {trigger.op_id}"
+                )
+            values = iter(consumer_ready)
         return _quantile(values, percentile)
 
     def estimate_iteration_end(self, percentile: float = 0.95) -> float:
@@ -326,6 +413,37 @@ class CudaEventRecorder:
             raise ValueError(f"Duplicate {marker.value} marker for {op_id}")
         markers[marker] = self._new_recorded_event(stream)
 
+    def alias_marker(
+        self,
+        op_id: SemanticOpId,
+        marker: TimelineMarker,
+        source_op_id: SemanticOpId,
+        source_marker: TimelineMarker,
+    ) -> None:
+        """Reuse an earlier semantic event as another operation's marker."""
+
+        if self._active is None:
+            raise RuntimeError("begin_iteration must be called before alias_marker")
+        markers = self._active.markers[op_id]
+        if marker in markers:
+            raise ValueError(f"Duplicate {marker.value} marker for {op_id}")
+        source = self._active.markers.get(source_op_id, {}).get(source_marker)
+        if source is None:
+            raise ValueError(
+                f"Missing source marker {source_op_id}/{source_marker.value}"
+            )
+        markers[marker] = source
+
+    def alias_origin(self, op_id: SemanticOpId, marker: TimelineMarker) -> None:
+        """Use the iteration origin as an operation marker."""
+
+        if self._active is None:
+            raise RuntimeError("begin_iteration must be called before alias_origin")
+        markers = self._active.markers[op_id]
+        if marker in markers:
+            raise ValueError(f"Duplicate {marker.value} marker for {op_id}")
+        markers[marker] = self._active.origin
+
     def end_iteration(self, stream: object | None = None) -> None:
         """Close the active iteration and queue it for asynchronous collection."""
 
@@ -378,13 +496,21 @@ class CudaEventRecorder:
         for op_id, markers in iteration.markers.items():
             if TimelineMarker.START not in markers or TimelineMarker.END not in markers:
                 raise RuntimeError(f"Operation {op_id} is missing START or END timing markers")
+            completion_us = timestamp(markers[TimelineMarker.END])
+            drain_us = timestamp(markers.get(TimelineMarker.DRAIN))
+            if drain_us is not None:
+                # Both markers follow a wait on the same NCCL Work, but their
+                # streams are otherwise unordered. The first marker is the
+                # tightest observed upper bound on device completion.
+                completion_us = min(completion_us, drain_us)
             samples.append(
                 OperationSample(
                     op_id=op_id,
                     iteration=iteration.iteration,
                     ready_us=timestamp(markers.get(TimelineMarker.READY)),
                     start_us=timestamp(markers[TimelineMarker.START]),
-                    end_us=timestamp(markers[TimelineMarker.END]),
+                    end_us=completion_us,
+                    drain_us=drain_us,
                     consumer_ready_us=timestamp(markers.get(TimelineMarker.CONSUMER_READY)),
                     consumer_resume_us=timestamp(markers.get(TimelineMarker.CONSUMER_RESUME)),
                     release_us=timestamp(markers.get(TimelineMarker.RELEASE)),

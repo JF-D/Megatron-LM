@@ -23,6 +23,7 @@ Test groups
 - TestWaitAsyncCommsFallback - inline-accumulation fallback when _wgrad_rs_handle is None
 - TestGTPDDPBucketAlignment  - GTP/regular DDP bucket ends padded for dist-opt alignment
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
+- TestGTPShardHandleTelemetry - async planner completion follows the work wait
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
 - TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and fallback equivalence
 
@@ -78,6 +79,65 @@ class _FakeGroup:
         return self._rank
 
 
+class TestGTPShardHandleTelemetry:
+    def test_planner_completion_follows_work_wait(self, monkeypatch):
+        calls = []
+
+        class _Work:
+            def wait(self):
+                calls.append("work_wait")
+
+        class _Planner:
+            def collective_end(self, token):
+                calls.append(("planner_end", token))
+
+        shard = object()
+        token = object()
+        planner = _Planner()
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
+        monkeypatch.setattr(gtp_module, "get_runtime_comm_planner", lambda: planner)
+
+        handle = gtp_module.GTPShardHandle(
+            _Work(),
+            [shard],
+            runtime_planner_token=token,
+        )
+        handle.wait()
+        handle.wait()
+
+        assert calls == ["work_wait", ("planner_end", token)]
+
+    def test_planner_completion_unwraps_one_shot_nvfp4_handles(self, monkeypatch):
+        class _Work:
+            pass
+
+        class _SingleNVFP4Handle:
+            def __init__(self, work):
+                self.async_handle = work
+
+        class _BatchedNVFP4Handle:
+            def __init__(self, work):
+                self.outer_async_handle = work
+
+        monkeypatch.setattr(
+            gtp_module, "_NVFP4AllGatherAsyncHandle", _SingleNVFP4Handle
+        )
+        monkeypatch.setattr(
+            gtp_module,
+            "BatchedNVFP4AllGatherAsyncHandle",
+            _BatchedNVFP4Handle,
+        )
+        work = _Work()
+
+        assert (
+            gtp_module._runtime_completion_work(_SingleNVFP4Handle(work)) is work
+        )
+        assert (
+            gtp_module._runtime_completion_work(_BatchedNVFP4Handle(work)) is work
+        )
+        assert gtp_module._runtime_completion_work(work) is work
+
+
 class TestGTPWeightCacheSchedulingDomain:
     @staticmethod
     def _make_param(group, chain_id):
@@ -96,18 +156,22 @@ class TestGTPWeightCacheSchedulingDomain:
         second = self._make_param(group, GTPChain.UNGRAPHED.value)
         first_ticket = cache.reserve(first, torch.bfloat16, fwd=True)
         first_buffer = cache.get(first_ticket)
+        first_spec = cache.planner_buffer_spec(first_ticket)
         cache.release(first_ticket)
         second_ticket = cache.reserve(second, torch.bfloat16, fwd=True)
         assert cache.get(second_ticket) is first_buffer
+        assert cache.planner_buffer_spec(second_ticket) == first_spec
         cache.release(second_ticket)
 
         graphed = self._make_param(group, GTPChain.GRAPHED.value)
         graphed_ticket = cache.reserve(graphed, torch.bfloat16, fwd=True)
         assert cache.get(graphed_ticket) is not first_buffer
+        assert cache.planner_buffer_spec(graphed_ticket)[0] != first_spec[0]
 
         other = self._make_param(other_group, GTPChain.UNGRAPHED.value)
         other_ticket = cache.reserve(other, torch.bfloat16, fwd=True)
         assert cache.get(other_ticket) is not first_buffer
+        assert cache.planner_buffer_spec(other_ticket)[0] != first_spec[0]
 
 
 def _worker_sharding_aligned(rank, world_size, port):

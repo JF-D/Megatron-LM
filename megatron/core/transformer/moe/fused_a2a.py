@@ -5,6 +5,8 @@
 
 from typing import Optional
 
+from megatron.core.communication_planner.graph import OperationKind, Phase
+from megatron.core.communication_planner.runtime import get_runtime_comm_planner
 from megatron.core.utils import internal_api
 
 try:
@@ -18,6 +20,12 @@ except ImportError:
 import torch
 
 _buffer = None
+
+
+def _runtime_payload_bytes(tensor) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel()) * int(tensor.element_size())
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
@@ -375,6 +383,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        runtime_comm_planner_scope=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -414,6 +423,17 @@ class HybridEPDispatch(torch.autograd.Function):
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
+        runtime_planner = get_runtime_comm_planner()
+        runtime_token = None
+        if runtime_planner.hooks_enabled:
+            runtime_token = runtime_planner.ep_start(
+                runtime_comm_planner_scope or "unresolved_hybridep",
+                phase=Phase.FORWARD,
+                kind=OperationKind.EP_DISPATCH,
+                communicator_size=group.size(),
+                payload_bytes=_runtime_payload_bytes(x),
+                stream=torch.cuda.current_stream(),
+            )
         # Process the dispatch
         (
             dispatched_hidden,
@@ -432,10 +452,14 @@ class HybridEPDispatch(torch.autograd.Function):
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
         )
+        if runtime_token is not None:
+            runtime_planner.ep_end(runtime_token, torch.cuda.current_stream())
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
+        ctx.runtime_comm_planner_scope = runtime_comm_planner_scope
+        ctx.runtime_comm_planner_group = group
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -450,6 +474,17 @@ class HybridEPDispatch(torch.autograd.Function):
         Backward pass of fused dispatch of the HybridEP backend
         '''
         handle = ctx.handle
+        runtime_planner = get_runtime_comm_planner()
+        runtime_token = None
+        if runtime_planner.hooks_enabled:
+            runtime_token = runtime_planner.ep_start(
+                ctx.runtime_comm_planner_scope or "unresolved_hybridep",
+                phase=Phase.BACKWARD,
+                kind=OperationKind.EP_COMBINE,
+                communicator_size=ctx.runtime_comm_planner_group.size(),
+                payload_bytes=_runtime_payload_bytes(grad_x),
+                stream=torch.cuda.current_stream(),
+            )
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x,
             probs=grad_probs,
@@ -457,10 +492,13 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
+        if runtime_token is not None:
+            runtime_planner.ep_end(runtime_token, torch.cuda.current_stream())
         return (
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -481,20 +519,44 @@ class HybridEPCombine(torch.autograd.Function):
     '''
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fused=False):
+    def forward(
+        ctx,
+        x,
+        handle,
+        num_permuted_tokens=None,
+        pad_multiple=None,
+        fused=False,
+        group=None,
+        runtime_comm_planner_scope=None,
+    ):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
+        runtime_planner = get_runtime_comm_planner()
+        runtime_token = None
+        if runtime_planner.hooks_enabled:
+            runtime_token = runtime_planner.ep_start(
+                runtime_comm_planner_scope or "unresolved_hybridep",
+                phase=Phase.FORWARD,
+                kind=OperationKind.EP_COMBINE,
+                communicator_size=group.size(),
+                payload_bytes=_runtime_payload_bytes(x),
+                stream=torch.cuda.current_stream(),
+            )
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=x,
             handle=handle,
             pad_multiple=pad_multiple,
             **({"fuse_unpermute_combine": fused} if fused else {}),
         )
+        if runtime_token is not None:
+            runtime_planner.ep_end(runtime_token, torch.cuda.current_stream())
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
         ctx.fused = fused
+        ctx.runtime_comm_planner_scope = runtime_comm_planner_scope
+        ctx.runtime_comm_planner_group = group
         return combined_hidden
 
     @staticmethod
@@ -503,6 +565,17 @@ class HybridEPCombine(torch.autograd.Function):
         Backward pass of fused combine of the HybridEP backend
         '''
         handle = ctx.handle
+        runtime_planner = get_runtime_comm_planner()
+        runtime_token = None
+        if runtime_planner.hooks_enabled:
+            runtime_token = runtime_planner.ep_start(
+                ctx.runtime_comm_planner_scope or "unresolved_hybridep",
+                phase=Phase.BACKWARD,
+                kind=OperationKind.EP_DISPATCH,
+                communicator_size=ctx.runtime_comm_planner_group.size(),
+                payload_bytes=_runtime_payload_bytes(grad_x),
+                stream=torch.cuda.current_stream(),
+            )
         dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=grad_x,
             scaling_factor=None,
@@ -511,7 +584,9 @@ class HybridEPCombine(torch.autograd.Function):
             num_permuted_tokens=ctx.num_permuted_tokens,
             **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
-        return dispatched_hidden, None, None, None, None
+        if runtime_token is not None:
+            runtime_planner.ep_end(runtime_token, torch.cuda.current_stream())
+        return dispatched_hidden, None, None, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
@@ -531,6 +606,7 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        runtime_comm_planner_scope=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -579,10 +655,19 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            runtime_comm_planner_scope,
         )
 
     @internal_api
-    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
+    def hybrid_ep_combine(
+        x,
+        handle,
+        num_permuted_tokens,
+        pad_multiple,
+        fused=False,
+        group=None,
+        runtime_comm_planner_scope=None,
+    ):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -599,7 +684,15 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
+        return HybridEPCombine.apply(
+            x,
+            handle,
+            num_permuted_tokens,
+            pad_multiple,
+            fused,
+            group,
+            runtime_comm_planner_scope,
+        )
 
 else:
     hybrid_ep_dispatch = None
