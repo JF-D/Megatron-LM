@@ -18,6 +18,7 @@ from .model import (
     GTPProfileKey,
     GTPWorkKind,
 )
+from .trace import build_gtp_chrome_trace
 
 
 class _CudaMarker(str, Enum):
@@ -36,7 +37,6 @@ class GTPProfileToken:
 class _CudaIteration:
     iteration: int
     origin: object
-    end: object | None
     markers: dict[GTPProfileKey, dict[_CudaMarker, object]]
 
 
@@ -60,7 +60,6 @@ class GTPCudaEventRecorder:
         self._active = _CudaIteration(
             iteration=iteration,
             origin=self._new_event(stream),
-            end=None,
             markers=defaultdict(dict),
         )
 
@@ -82,9 +81,9 @@ class GTPCudaEventRecorder:
     def end_iteration(self, stream: object | None = None) -> None:
         """Close and enqueue the current iteration for asynchronous collection."""
 
+        del stream
         if self._active is None:
             raise RuntimeError("No CUDA-profile iteration is active")
-        self._active.end = self._new_event(stream)
         self._pending.append(self._active)
         self._active = None
 
@@ -100,11 +99,11 @@ class GTPCudaEventRecorder:
         remaining: deque[_CudaIteration] = deque()
         while self._pending:
             iteration = self._pending.popleft()
-            events = [iteration.origin, iteration.end]
+            events = [iteration.origin]
             events.extend(
                 event for markers in iteration.markers.values() for event in markers.values()
             )
-            if any(event is None or not event.query() for event in events):
+            if any(not event.query() for event in events):
                 remaining.append(iteration)
                 continue
             completed.append((iteration.iteration, self._samples(iteration)))
@@ -255,7 +254,7 @@ class GTPRuntimeProfiler:
                     del unused_module, unused_inputs, unused_output
                     stream = _current_cuda_stream()
                     for scope in scopes:
-                        self.compute_end(scope, stream)
+                        self.forward_compute_end(scope, stream)
 
                 self._hook_handles.append(module.register_forward_hook(forward_end_hook))
         return len(attached_modules)
@@ -380,10 +379,13 @@ class GTPRuntimeProfiler:
             self.recorder.record(token.key, _CudaMarker.START, stream)
         return token
 
-    def compute_end(self, scope: str, stream: object | None = None) -> None:
-        """Close the most recently started compute operation for ``scope``."""
+    def forward_compute_end(self, scope: str, stream: object | None = None) -> None:
+        """Close forward or recompute work at the owning module's forward hook."""
 
-        token = self._pop_active_compute(scope)
+        token = self._pop_active_compute(
+            scope,
+            allowed_phases=frozenset({GTPPhase.FORWARD, GTPPhase.RECOMPUTE}),
+        )
         if token is None:
             return
         if self._recording:
@@ -394,14 +396,18 @@ class GTPRuntimeProfiler:
     ) -> GTPProfileToken | None:
         """Close backward compute and create its asynchronous RS side branch."""
 
-        token = self._pop_active_compute(scope, GTPPhase.BACKWARD)
+        token = self._pop_active_compute(
+            scope, allowed_phases=frozenset({GTPPhase.BACKWARD})
+        )
         if token is None:
             # Embedding and other direct-gradient paths have no backward weight
             # materialization. Preserve their place in the chain as a point compute.
             token = self.compute_start(scope, GTPPhase.BACKWARD, stream)
             if token is None:
                 return None
-            token = self._pop_active_compute(scope, GTPPhase.BACKWARD)
+            token = self._pop_active_compute(
+                scope, allowed_phases=frozenset({GTPPhase.BACKWARD})
+            )
             assert token is not None
         if self._recording:
             self.recorder.record(token.key, _CudaMarker.END, stream)
@@ -436,7 +442,9 @@ class GTPRuntimeProfiler:
         return GTPProfileToken(GTPProfileKey(scope, phase, kind, occurrence))
 
     def _pop_active_compute(
-        self, scope: str, phase: GTPPhase | None = None
+        self,
+        scope: str,
+        allowed_phases: frozenset[GTPPhase],
     ) -> GTPProfileToken | None:
         tokens = self._active_compute.get(scope)
         if not tokens:
@@ -445,7 +453,7 @@ class GTPRuntimeProfiler:
             (
                 index
                 for index in range(len(tokens) - 1, -1, -1)
-                if phase is None or tokens[index].key.phase is phase
+                if tokens[index].key.phase in allowed_phases
             ),
             None,
         )
@@ -494,9 +502,22 @@ class GTPRuntimeProfiler:
         }
         rank = _distributed_rank()
         path = self.config.log_dir / f"rank{rank:05d}_gtp_execution_model.json"
+        trace_path = self.config.log_dir / f"rank{rank:05d}_gtp_execution_trace.json"
+        payload["diagnostics"]["trace_file"] = trace_path.name
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2)
+            stream.write("\n")
+        with trace_path.open("w", encoding="utf-8") as stream:
+            json.dump(
+                build_gtp_chrome_trace(
+                    self._samples,
+                    model.dependencies,
+                    rank=rank,
+                ),
+                stream,
+                indent=2,
+            )
             stream.write("\n")
         self._dumped = True
         self._remove_hooks()

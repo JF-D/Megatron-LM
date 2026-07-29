@@ -36,6 +36,10 @@ orders and validates that they are stable across sampled iterations.
 - Backward compute starts after backward weight materialization and ends when
   the resulting wgrad reaches the RS callsite.
 
+These are GTP consumer intervals, not a complete GPU-occupancy trace. Time
+between consecutive intervals is unmodeled work and must not be interpreted as
+GPU idle time.
+
 Dependency edges come from these semantic callsites, so the profiler does not
 spend extra CUDA events measuring redundant logical-ready timestamps.
 
@@ -58,14 +62,19 @@ Each rank writes:
 
 ```text
 rankXXXXX_gtp_execution_model.json
+rankXXXXX_gtp_execution_trace.json
 ```
 
-The artifact contains CUDA-duration summaries, observed phase order, existing
-parameter chains, and only these dependency kinds:
+The model artifact contains CUDA-duration summaries, observed phase order,
+existing parameter chains, and only these dependency kinds:
 
 - `compute_order`
 - `ag_before_compute`
 - `compute_before_rs`
+
+The Chrome Trace artifact retains the sampled CUDA intervals for manual
+boundary inspection. It renders only compute, AG, and RS, and draws only
+`ag_before_compute` and `compute_before_rs` flows.
 
 Profiling cost is bounded by the configured sample count. Each observed compute,
 AG, or RS uses two timing events; raw CUDA kernels, CPU operators, and generic

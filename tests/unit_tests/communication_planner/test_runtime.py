@@ -3,6 +3,7 @@
 import json
 import math
 
+import megatron.core.communication_planner.runtime as runtime_module
 from megatron.core.communication_planner import (
     GTPCudaEventRecorder,
     GTPPhase,
@@ -56,7 +57,7 @@ class _FakeParameter:
 class _FakeModule:
     def __init__(self, parameters):
         self._parameters = parameters
-        self.handle = None
+        self.handles = []
 
     def named_parameters(self):
         return ((parameter._debug_name, parameter) for parameter in self._parameters)
@@ -68,10 +69,10 @@ class _FakeModule:
         del recurse
         return iter(self._parameters)
 
-    def register_forward_hook(self, unused_hook):
-        del unused_hook
-        self.handle = _FakeHandle()
-        return self.handle
+    def register_forward_hook(self, hook):
+        handle = _FakeHandle()
+        self.handles.append((hook, handle))
+        return handle
 
 
 def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_path):
@@ -87,7 +88,12 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
     profiler.communication_start(forward_ag, _FakeStream(0.2))
     profiler.communication_end(forward_ag, _FakeStream(1.2))
     profiler.compute_start("output_layer", GTPPhase.FORWARD, _FakeStream(1.3))
-    profiler.compute_end("output_layer", _FakeStream(3.3))
+    original_current_stream = runtime_module._current_cuda_stream
+    runtime_module._current_cuda_stream = lambda: _FakeStream(3.3)
+    try:
+        module.handles[0][0](module, (), None)
+    finally:
+        runtime_module._current_cuda_stream = original_current_stream
 
     backward_ag = profiler.ag_ready("output_layer", GTPPhase.BACKWARD)
     profiler.communication_start(backward_ag, _FakeStream(4.1))
@@ -113,11 +119,19 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
     artifact = tmp_path / "rank00000_gtp_execution_model.json"
     payload = json.loads(artifact.read_text())
     assert payload["diagnostics"]["timing_source"] == "cuda_events"
+    assert payload["diagnostics"]["trace_file"] == "rank00000_gtp_execution_trace.json"
     assert {
         dependency["kind"] for dependency in payload["dependencies"]
     } == {"ag_before_compute", "compute_before_rs"}
+
+    trace = json.loads((tmp_path / payload["diagnostics"]["trace_file"]).read_text())
+    spans = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+    assert {event["args"]["kind"] for event in spans} == {"compute", "ag", "rs"}
+    assert sum(event["ph"] == "s" for event in trace["traceEvents"]) == 3
+    assert not any("finalize" in event["name"] or "bucket" in event["name"] for event in spans)
     assert profiler.complete
-    assert module.handle.removed
+    assert len(module.handles) == 1
+    assert module.handles[0][1].removed
     profiler.begin_iteration(8, _FakeStream(21.0))
     assert not profiler.active
 
@@ -147,3 +161,21 @@ def test_attach_model_profiles_only_the_routed_expert_group_leader(tmp_path):
 
     assert profiler.attach_model(module) == 1
     assert profiler._parameters == {"experts.weight0": leader}
+    assert len(module.handles) == 1
+
+
+def test_forward_end_does_not_close_backward_compute(tmp_path):
+    profiler = GTPRuntimeProfiler(
+        GTPRuntimeProfileConfig(warmup_iters=1, profile_iters=1, log_dir=tmp_path),
+        _recorder(),
+    )
+    profiler.begin_iteration(1, _FakeStream(0.0))
+    profiler.compute_start("layer", GTPPhase.BACKWARD, _FakeStream(1.0))
+
+    profiler.forward_compute_end("layer", _FakeStream(2.0))
+    rs = profiler.rs_ready("layer", _FakeStream(3.0))
+
+    assert rs is not None
+    assert rs.key.occurrence == 0
+    profiler.end_iteration(_FakeStream(4.0))
+    assert not profiler.errors
