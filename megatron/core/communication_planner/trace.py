@@ -5,24 +5,80 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
-from .model import GTPCudaSample, GTPDependency, GTPPhase, GTPProfileKey, GTPWorkKind
+from .model import (
+    GTPCudaSample,
+    GTPCommDomain,
+    GTPDependency,
+    GTPModuleInfo,
+    GTPPhase,
+    GTPProfileKey,
+    GTPWorkKind,
+)
 
 
 _LANE_LAYOUT = {
-    (GTPPhase.FORWARD, GTPWorkKind.COMPUTE): (100, "Forward GTP consumer intervals"),
-    (GTPPhase.RECOMPUTE, GTPWorkKind.COMPUTE): (120, "Recompute GTP consumer intervals"),
-    (GTPPhase.BACKWARD, GTPWorkKind.COMPUTE): (140, "Backward GTP consumer intervals"),
-    (GTPPhase.FORWARD, GTPWorkKind.AG): (200, "Forward GTP AG"),
-    (GTPPhase.RECOMPUTE, GTPWorkKind.AG): (220, "Recompute GTP AG"),
-    (GTPPhase.BACKWARD, GTPWorkKind.AG): (240, "Backward GTP AG"),
-    (GTPPhase.BACKWARD, GTPWorkKind.RS): (300, "Backward GTP RS"),
+    (GTPPhase.FORWARD, GTPWorkKind.COMPUTE_ELEMENT, None): (
+        100,
+        "Forward coarse schedule elements",
+    ),
+    (GTPPhase.RECOMPUTE, GTPWorkKind.COMPUTE_ELEMENT, None): (
+        200,
+        "Recompute coarse schedule elements",
+    ),
+    (GTPPhase.BACKWARD, GTPWorkKind.COMPUTE_ELEMENT, None): (
+        300,
+        "Backward coarse schedule elements",
+    ),
+    (GTPPhase.FORWARD, GTPWorkKind.COMPUTE, None): (
+        400,
+        "Forward GTP consumer intervals",
+    ),
+    (GTPPhase.RECOMPUTE, GTPWorkKind.COMPUTE, None): (
+        500,
+        "Recompute GTP consumer intervals",
+    ),
+    (GTPPhase.BACKWARD, GTPWorkKind.COMPUTE, None): (
+        600,
+        "Backward GTP consumer intervals",
+    ),
+    (GTPPhase.FORWARD, GTPWorkKind.AG, GTPCommDomain.GTP): (2000, "Forward GTP AG"),
+    (GTPPhase.FORWARD, GTPWorkKind.AG, GTPCommDomain.EGTP): (
+        2100,
+        "Forward EGTP AG",
+    ),
+    (GTPPhase.RECOMPUTE, GTPWorkKind.AG, GTPCommDomain.GTP): (
+        2200,
+        "Recompute GTP AG",
+    ),
+    (GTPPhase.RECOMPUTE, GTPWorkKind.AG, GTPCommDomain.EGTP): (
+        2300,
+        "Recompute EGTP AG",
+    ),
+    (GTPPhase.BACKWARD, GTPWorkKind.AG, GTPCommDomain.GTP): (
+        2400,
+        "Backward GTP AG",
+    ),
+    (GTPPhase.BACKWARD, GTPWorkKind.AG, GTPCommDomain.EGTP): (
+        2500,
+        "Backward EGTP AG",
+    ),
+    (GTPPhase.BACKWARD, GTPWorkKind.RS, GTPCommDomain.GTP): (
+        2600,
+        "Backward GTP RS",
+    ),
+    (GTPPhase.BACKWARD, GTPWorkKind.RS, GTPCommDomain.EGTP): (
+        2700,
+        "Backward EGTP RS",
+    ),
 }
 _FLOW_DEPENDENCIES = frozenset({"ag_before_compute", "compute_before_rs"})
 _COLORS = {
     GTPWorkKind.COMPUTE: "thread_state_running",
+    GTPWorkKind.COMPUTE_ELEMENT: "thread_state_running",
+    GTPWorkKind.MATERIALIZE: "thread_state_iowait",
     GTPWorkKind.AG: "rail_response",
     GTPWorkKind.RS: "rail_animation",
 }
@@ -35,9 +91,24 @@ def _metadata(name: str, pid: int, tid: int, args: dict[str, Any]) -> dict[str, 
 def _pack_lanes(
     samples: Iterable[GTPCudaSample],
 ) -> tuple[dict[GTPProfileKey, int], list[tuple[int, str]]]:
-    grouped: dict[tuple[GTPPhase, GTPWorkKind], list[GTPCudaSample]] = defaultdict(list)
+    grouped: dict[
+        tuple[GTPPhase, GTPWorkKind, GTPCommDomain | None], list[GTPCudaSample]
+    ] = defaultdict(list)
     for sample in samples:
-        grouped[(sample.key.phase, sample.key.kind)].append(sample)
+        if sample.key.kind in (
+            GTPWorkKind.COMPUTE_ELEMENT,
+            GTPWorkKind.MATERIALIZE,
+        ):
+            group = (
+                sample.key.phase,
+                GTPWorkKind.COMPUTE_ELEMENT,
+                None,
+            )
+        elif sample.key.kind is GTPWorkKind.COMPUTE:
+            group = (sample.key.phase, sample.key.kind, None)
+        else:
+            group = (sample.key.phase, sample.key.kind, sample.key.domain)
+        grouped[group].append(sample)
 
     lane_for_key = {}
     lane_names = []
@@ -70,9 +141,13 @@ def build_gtp_chrome_trace(
     dependencies: Iterable[GTPDependency],
     *,
     rank: int,
+    parameter_modules: Mapping[str, GTPModuleInfo] | None = None,
+    compute_element_targets: Mapping[GTPProfileKey, GTPProfileKey] | None = None,
 ) -> dict[str, Any]:
     """Build a compact Chrome Trace from raw GTP CUDA-event samples."""
 
+    parameter_modules = parameter_modules or {}
+    compute_element_targets = compute_element_targets or {}
     samples_by_iteration: dict[int, list[GTPCudaSample]] = defaultdict(list)
     for sample in samples:
         samples_by_iteration[sample.iteration].append(sample)
@@ -109,10 +184,21 @@ def build_gtp_chrome_trace(
             iteration_samples, key=lambda item: (item.start_us, item.key.stable_key)
         ):
             key = sample.key
+            target = compute_element_targets.get(key)
+            source_module = parameter_modules.get(key.scope)
+            target_module = parameter_modules.get(target.scope) if target is not None else None
+            name = f"{key.scope} · {key.kind.value}"
+            if target is not None:
+                name = (
+                    f"{_module_label(source_module)} · {_short_scope(key.scope)} → "
+                    f"{_module_label(target_module)} · {_short_scope(target.scope)}"
+                )
             events.append(
                 {
-                    "name": f"{key.scope} · {key.kind.value}",
-                    "cat": f"gtp,{key.phase.value},{key.kind.value}",
+                    "name": name,
+                    "cat": (
+                        f"gtp,{key.domain.value},{key.phase.value},{key.kind.value}"
+                    ),
                     "ph": "X",
                     "ts": sample.start_us,
                     "dur": sample.duration_us,
@@ -125,11 +211,43 @@ def build_gtp_chrome_trace(
                         "phase": key.phase.value,
                         "kind": key.kind.value,
                         "occurrence": key.occurrence,
+                        "communication_domain": key.domain.value,
+                        "module": (
+                            _module_info_to_dict(source_module)
+                            if source_module is not None
+                            else None
+                        ),
+                        "next_consumer": (
+                            {
+                                "id": target.stable_key,
+                                "scope": target.scope,
+                                "module": (
+                                    _module_info_to_dict(target_module)
+                                    if target_module is not None
+                                    else None
+                                ),
+                                "crosses_module_boundary": (
+                                    source_module is not None
+                                    and target_module is not None
+                                    and source_module.scope != target_module.scope
+                                ),
+                            }
+                            if target is not None
+                            else None
+                        ),
                         "cuda_duration_us": sample.duration_us,
                         "interval_note": (
-                            "Gaps between GTP consumer intervals are unmodeled, not GPU idle"
+                            "Direct GTP consumer interval"
                             if key.kind is GTPWorkKind.COMPUTE
-                            else "CUDA service interval on the GTP communication stream"
+                            else (
+                                "Non-overlapping compute window until the next GTP consumer"
+                                if key.kind is GTPWorkKind.COMPUTE_ELEMENT
+                                else (
+                                    "Exposed current-weight materialization interval"
+                                    if key.kind is GTPWorkKind.MATERIALIZE
+                                    else "CUDA service interval on the GTP communication stream"
+                                )
+                            )
                         ),
                     },
                 }
@@ -176,8 +294,38 @@ def build_gtp_chrome_trace(
             "timestamp_unit": "microseconds",
             "rank": rank,
             "iterations": sorted(samples_by_iteration),
-            "operation_kinds": ["compute", "ag", "rs"],
+            "operation_kinds": [
+                "compute_element",
+                "materialize",
+                "compute",
+                "ag",
+                "rs",
+            ],
+            "communication_domains": ["gtp", "egtp"],
             "dependency_kinds": sorted(_FLOW_DEPENDENCIES),
-            "compute_gap_semantics": "unmodeled work; never interpret as GPU idle",
+            "compute_element_semantics": (
+                "current consumer compute-start to next consumer-ready; "
+                "includes coarse parameterless work and excludes next materialization"
+            ),
         },
+    }
+
+
+def _module_label(module: GTPModuleInfo | None) -> str:
+    if module is None:
+        return "?"
+    if module.layer_number is None:
+        return module.symbol
+    return f"{module.symbol}{module.layer_number}"
+
+
+def _short_scope(scope: str) -> str:
+    return ".".join(scope.split(".")[-3:])
+
+
+def _module_info_to_dict(module: GTPModuleInfo) -> dict[str, Any]:
+    return {
+        "scope": module.scope,
+        "symbol": module.symbol,
+        "layer_number": module.layer_number,
     }

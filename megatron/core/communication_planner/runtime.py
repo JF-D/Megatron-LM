@@ -13,7 +13,9 @@ from pathlib import Path
 
 from .model import (
     GTPCudaSample,
+    GTPCommDomain,
     GTPExecutionModel,
+    GTPModuleInfo,
     GTPPhase,
     GTPProfileKey,
     GTPWorkKind,
@@ -91,6 +93,12 @@ class GTPCudaEventRecorder:
         """Discard an incomplete active iteration."""
 
         self._active = None
+
+    def discard(self, key: GTPProfileKey) -> None:
+        """Discard markers for an intentionally unterminated operation."""
+
+        if self._active is not None:
+            self._active.markers.pop(key, None)
 
     def collect_completed(self) -> tuple[tuple[int, tuple[GTPCudaSample, ...]], ...]:
         """Collect completed event sets without calling synchronize."""
@@ -181,12 +189,24 @@ class GTPRuntimeProfiler:
         self._active_iteration: int | None = None
         self._counters: dict[tuple[str, GTPPhase, GTPWorkKind], int] = defaultdict(int)
         self._active_compute: dict[str, list[GTPProfileToken]] = defaultdict(list)
+        self._active_compute_element: GTPProfileToken | None = None
+        self._pending_materialize: dict[
+            tuple[str, GTPPhase], list[GTPProfileToken]
+        ] = defaultdict(list)
         self._current_orders: dict[GTPPhase, list[GTPProfileKey]] = defaultdict(list)
         self._reference_orders: dict[GTPPhase, tuple[GTPProfileKey, ...]] | None = None
+        self._current_compute_element_targets: dict[
+            GTPProfileKey, GTPProfileKey
+        ] = {}
+        self._reference_compute_element_targets: dict[
+            GTPProfileKey, GTPProfileKey
+        ] | None = None
         self._samples: list[GTPCudaSample] = []
         self._errors: list[str] = []
         self._hook_handles: list[object] = []
         self._parameters: dict[str, object] = {}
+        self._communication_domains: dict[str, GTPCommDomain] = {}
+        self._parameter_modules: dict[str, GTPModuleInfo] = {}
         self._dumped = False
 
     @property
@@ -225,7 +245,15 @@ class GTPRuntimeProfiler:
             parameter_names = {
                 id(parameter): f"{prefix}{name}" for name, parameter in chunk.named_parameters()
             }
-            for _, module in chunk.named_modules():
+            named_modules = list(chunk.named_modules())
+            module_names = {
+                id(module): f"{prefix}{name}" for name, module in named_modules
+            }
+            module_by_parameter = _hybrid_module_info_by_parameter(
+                named_modules,
+                module_names,
+            )
+            for module_name, module in named_modules:
                 scopes = []
                 for parameter in module.parameters(recurse=False):
                     if not getattr(parameter, "is_distributed_weight", False):
@@ -244,6 +272,26 @@ class GTPRuntimeProfiler:
                     if not scope:
                         continue
                     self._parameters[scope] = parameter
+                    domain = (
+                        GTPCommDomain.EGTP
+                        if getattr(parameter, "is_routed_expert", False)
+                        else GTPCommDomain.GTP
+                    )
+                    previous_domain = self._communication_domains.setdefault(scope, domain)
+                    if previous_domain is not domain:
+                        raise ValueError(
+                            f"GTP profile scope {scope!r} belongs to both "
+                            f"{previous_domain.value} and {domain.value}"
+                        )
+                    qualified_module_name = f"{prefix}{module_name}".rstrip(".")
+                    module_scope = qualified_module_name or scope.rsplit(".", 1)[0]
+                    self._parameter_modules[scope] = module_by_parameter.get(
+                        id(parameter),
+                        GTPModuleInfo(
+                            scope=module_scope or scope,
+                            symbol=_infer_module_symbol(scope),
+                        ),
+                    )
                     scopes.append(scope)
                 scopes = sorted(set(scopes))
                 if not scopes or id(module) in attached_modules:
@@ -263,7 +311,17 @@ class GTPRuntimeProfiler:
                         del unused_module, unused_grad_output
                         stream = _current_cuda_stream()
                         for scope in scopes:
-                            self.compute_start(scope, GTPPhase.BACKWARD, stream)
+                            materialize = self.consumer_ready(
+                                scope,
+                                GTPPhase.BACKWARD,
+                                stream,
+                            )
+                            self.compute_start(
+                                scope,
+                                GTPPhase.BACKWARD,
+                                stream,
+                                materialize_token=materialize,
+                            )
 
                     self._hook_handles.append(
                         module.register_full_backward_pre_hook(backward_start_hook)
@@ -280,7 +338,10 @@ class GTPRuntimeProfiler:
         self._active_iteration = iteration
         self._counters = defaultdict(int)
         self._active_compute = defaultdict(list)
+        self._active_compute_element = None
+        self._pending_materialize = defaultdict(list)
         self._current_orders = defaultdict(list)
+        self._current_compute_element_targets = {}
         self._recording = (
             self._iteration_ordinal >= self.config.warmup_iters
             and self._profile_started < self.config.profile_iters
@@ -294,31 +355,61 @@ class GTPRuntimeProfiler:
 
         if self._active_iteration is None:
             return
-        if self._active_compute:
+        unfinished_materialize = [
+            token.key.stable_key
+            for tokens in self._pending_materialize.values()
+            for token in tokens
+        ]
+        if self._active_compute or unfinished_materialize:
             unfinished = sorted(
                 token.key.stable_key
                 for tokens in self._active_compute.values()
                 for token in tokens
             )
+            unfinished.extend(sorted(unfinished_materialize))
             self._errors.append(
                 f"iteration {self._active_iteration} has unfinished compute operations: "
                 f"{unfinished[:8]}"
             )
             if self._recording:
                 self.recorder.abort_iteration()
-        elif self._recording:
-            self.recorder.end_iteration(stream)
+        else:
+            if self._recording and self._active_compute_element is not None:
+                # A compute element is defined only between two consumers. The final
+                # consumer in an iteration deliberately has no right-hand boundary.
+                self.recorder.discard(self._active_compute_element.key)
+            if self._recording:
+                self.recorder.end_iteration(stream)
 
         orders = {
             phase: tuple(order)
             for phase, order in self._current_orders.items()
             if order
         }
+        consumer_count = sum(len(order) for order in orders.values())
+        expected_elements = max(consumer_count - 1, 0)
+        if len(self._current_compute_element_targets) != expected_elements:
+            self._errors.append(
+                f"iteration {self._active_iteration} captured "
+                f"{len(self._current_compute_element_targets)} compute elements "
+                f"for {consumer_count} consumers; expected {expected_elements}"
+            )
         if self._reference_orders is None:
             self._reference_orders = orders
         elif orders != self._reference_orders:
             self._errors.append(
                 f"iteration {self._active_iteration} changed the GTP execution order"
+            )
+        if self._reference_compute_element_targets is None:
+            self._reference_compute_element_targets = dict(
+                self._current_compute_element_targets
+            )
+        elif (
+            self._current_compute_element_targets
+            != self._reference_compute_element_targets
+        ):
+            self._errors.append(
+                f"iteration {self._active_iteration} changed the GTP compute elements"
             )
 
         self._active_iteration = None
@@ -357,6 +448,28 @@ class GTPRuntimeProfiler:
 
         return self._new_token(scope, phase, GTPWorkKind.AG)
 
+    def consumer_ready(
+        self,
+        scope: str,
+        phase: GTPPhase,
+        stream: object | None = None,
+    ) -> GTPProfileToken | None:
+        """Mark a GTP consumer before it waits for its current weight."""
+
+        token = self._new_token(scope, phase, GTPWorkKind.MATERIALIZE)
+        if token is None:
+            return None
+        if self._active_compute_element is not None:
+            element = self._active_compute_element
+            self._current_compute_element_targets[element.key] = token.key
+            if self._recording:
+                self.recorder.record(element.key, _CudaMarker.END, stream)
+        self._active_compute_element = None
+        self._pending_materialize[(scope, phase)].append(token)
+        if self._recording:
+            self.recorder.record(token.key, _CudaMarker.START, stream)
+        return token
+
     def communication_start(
         self, token: GTPProfileToken | None, stream: object | None = None
     ) -> None:
@@ -378,16 +491,46 @@ class GTPRuntimeProfiler:
         scope: str,
         phase: GTPPhase,
         stream: object | None = None,
+        *,
+        materialize_token: GTPProfileToken | None = None,
     ) -> GTPProfileToken | None:
         """Record dependent module compute start after its AG is available."""
+
+        if self._active_iteration is None:
+            return None
+        if materialize_token is None:
+            pending = self._pending_materialize.get((scope, phase))
+            materialize_token = pending[0] if pending else None
+        if materialize_token is None:
+            materialize_token = self.consumer_ready(scope, phase, stream)
+        if materialize_token is None:
+            return None
+        self._remove_pending_materialize(materialize_token)
+        if self._recording:
+            self.recorder.record(
+                materialize_token.key,
+                _CudaMarker.END,
+                stream,
+            )
 
         token = self._new_token(scope, phase, GTPWorkKind.COMPUTE)
         if token is None:
             return None
+        element = GTPProfileToken(
+            GTPProfileKey(
+                scope=scope,
+                phase=phase,
+                kind=GTPWorkKind.COMPUTE_ELEMENT,
+                occurrence=token.key.occurrence,
+                domain=token.key.domain,
+            )
+        )
         self._current_orders[phase].append(token.key)
         self._active_compute[scope].append(token)
         if self._recording:
             self.recorder.record(token.key, _CudaMarker.START, stream)
+            self.recorder.record(element.key, _CudaMarker.START, stream)
+        self._active_compute_element = element
         return token
 
     def forward_compute_end(self, scope: str, stream: object | None = None) -> None:
@@ -411,8 +554,9 @@ class GTPRuntimeProfiler:
             scope, allowed_phases=frozenset({GTPPhase.BACKWARD})
         )
         if token is None:
-            # Embedding and other direct-gradient paths have no backward weight
-            # materialization. Preserve their place in the chain as a point compute.
+            self._errors.append(
+                f"{scope} reached RS without a backward compute-start marker"
+            )
             token = self.compute_start(scope, GTPPhase.BACKWARD, stream)
             if token is None:
                 return None
@@ -427,6 +571,7 @@ class GTPRuntimeProfiler:
             phase=GTPPhase.BACKWARD,
             kind=GTPWorkKind.RS,
             occurrence=token.key.occurrence,
+            domain=token.key.domain,
         )
         rs_token = GTPProfileToken(rs_key)
         return rs_token
@@ -440,6 +585,8 @@ class GTPRuntimeProfiler:
             phase_orders=self._reference_orders,
             samples=self._samples,
             parameter_chains=self._parameter_chains(),
+            parameter_modules=self._parameter_modules,
+            compute_element_targets=self._reference_compute_element_targets,
         )
 
     def _new_token(
@@ -450,7 +597,26 @@ class GTPRuntimeProfiler:
         counter_key = (scope, phase, kind)
         occurrence = self._counters[counter_key]
         self._counters[counter_key] += 1
-        return GTPProfileToken(GTPProfileKey(scope, phase, kind, occurrence))
+        return GTPProfileToken(
+            GTPProfileKey(
+                scope=scope,
+                phase=phase,
+                kind=kind,
+                occurrence=occurrence,
+                domain=self._communication_domains.get(scope, GTPCommDomain.GTP),
+            )
+        )
+
+    def _remove_pending_materialize(self, token: GTPProfileToken) -> None:
+        key = (token.key.scope, token.key.phase)
+        tokens = self._pending_materialize.get(key)
+        if not tokens or token not in tokens:
+            raise RuntimeError(
+                f"Unknown GTP materialize token {token.key.stable_key}"
+            )
+        tokens.remove(token)
+        if not tokens:
+            del self._pending_materialize[key]
 
     def _pop_active_compute(
         self,
@@ -509,6 +675,12 @@ class GTPRuntimeProfiler:
             "errors": list(self._errors),
             "profile_iterations_started": self._profile_started,
             "sample_count": len(self._samples),
+            "consumer_count": sum(
+                len(order) for order in self._reference_orders.values()
+            ),
+            "compute_element_count": len(
+                self._reference_compute_element_targets or {}
+            ),
             "timing_source": "cuda_events",
         }
         rank = _distributed_rank()
@@ -525,6 +697,8 @@ class GTPRuntimeProfiler:
                     self._samples,
                     model.dependencies,
                     rank=rank,
+                    parameter_modules=model.parameter_modules,
+                    compute_element_targets=model.compute_element_targets,
                 ),
                 stream,
                 indent=2,
@@ -616,6 +790,44 @@ def _distributed_rank() -> int:
     except (AttributeError, ImportError, RuntimeError):
         pass
     return 0
+
+
+def _hybrid_module_info_by_parameter(
+    named_modules: list[tuple[str, object]],
+    module_names: Mapping[int, str],
+) -> dict[int, GTPModuleInfo]:
+    """Map parameters to the enclosing hybrid M/*/E layer."""
+
+    result = {}
+    for _, container in named_modules:
+        layer_types = getattr(container, "layer_type_list", None)
+        layers = getattr(container, "layers", None)
+        if layer_types is None or layers is None:
+            continue
+        materialized_layers = list(layers)
+        if len(layer_types) != len(materialized_layers):
+            continue
+        for symbol, layer in zip(layer_types, materialized_layers):
+            module_scope = module_names.get(id(layer), "")
+            if not module_scope or not hasattr(layer, "parameters"):
+                continue
+            layer_number = getattr(layer, "layer_number", None)
+            info = GTPModuleInfo(
+                scope=module_scope,
+                symbol=str(symbol),
+                layer_number=int(layer_number) if layer_number is not None else None,
+            )
+            for parameter in layer.parameters():
+                result.setdefault(id(parameter), info)
+    return result
+
+
+def _infer_module_symbol(scope: str) -> str:
+    if "embedding" in scope:
+        return "embedding"
+    if "output_layer" in scope:
+        return "output"
+    return "other"
 
 
 def _first_scope_occurrences(

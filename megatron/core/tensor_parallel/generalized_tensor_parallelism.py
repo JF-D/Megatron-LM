@@ -1457,6 +1457,15 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
+        runtime_profiler = get_gtp_runtime_profiler()
+        profile_active = runtime_profiler is not None and runtime_profiler.active
+        materialize_token = None
+        if profile_active:
+            materialize_token = runtime_profiler.consumer_ready(
+                self._debug_name,
+                GTPPhase.BACKWARD,
+                torch.cuda.current_stream(),
+            )
 
         if GTP_CONFIG.weight_prefetch and self.next_w is not None:
             result = self._get_prefetched_weight(False)
@@ -1486,6 +1495,13 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 cache.release(w._ag_ticket_bwd)
 
+        if profile_active:
+            runtime_profiler.compute_start(
+                self._debug_name,
+                GTPPhase.BACKWARD,
+                torch.cuda.current_stream(),
+                materialize_token=materialize_token,
+            )
         return result
 
     def batched_all_gather_and_prefetch_bwd(self, nvtx_label=None):
@@ -1499,6 +1515,17 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
+        runtime_profiler = get_gtp_runtime_profiler()
+        profile_active = runtime_profiler is not None and runtime_profiler.active
+        profile_phase = None
+        materialize_token = None
+        if profile_active:
+            profile_phase = _runtime_profile_phase(fwd)
+            materialize_token = runtime_profiler.consumer_ready(
+                self._debug_name,
+                profile_phase,
+                torch.cuda.current_stream(),
+            )
         # During an activation-recompute forward (runs in backward), route consume +
         # prefetch through the recompute-forward chain on its own _recompute_* slot
         # (see __init__) instead of the fwd/bwd chains; lazy-built below.
@@ -1584,6 +1611,14 @@ class GTPShardedParam(torch.nn.Parameter):
             chain["link_table_flushed"] = True
             log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
 
+        if profile_active:
+            assert profile_phase is not None
+            runtime_profiler.compute_start(
+                self._debug_name,
+                profile_phase,
+                torch.cuda.current_stream(),
+                materialize_token=materialize_token,
+            )
         return result
 
     def batched_all_gather_and_prefetch(self, **kwargs):
@@ -1894,27 +1929,11 @@ class GTPShardedParam(torch.nn.Parameter):
     # ------------------------------------------------------------------
     def materialize_group_for_forward(self):
         """Protocol: all-gather the group's shard(s) for the forward GEMM."""
-        result = self.all_gather_and_prefetch(fwd=True)
-        runtime_profiler = get_gtp_runtime_profiler()
-        if runtime_profiler is not None and runtime_profiler.active:
-            runtime_profiler.compute_start(
-                self._debug_name,
-                _runtime_profile_phase(True),
-                torch.cuda.current_stream(),
-            )
-        return result
+        return self.all_gather_and_prefetch(fwd=True)
 
     def materialize_group_for_backward(self, nvtx_label=None):
         """Protocol: re-materialize the group's weight(s) for the backward GEMMs."""
-        result = self.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
-        runtime_profiler = get_gtp_runtime_profiler()
-        if runtime_profiler is not None and runtime_profiler.active:
-            runtime_profiler.compute_start(
-                self._debug_name,
-                GTPPhase.BACKWARD,
-                torch.cuda.current_stream(),
-            )
-        return result
+        return self.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
 
     def finalize_group_grads(self, wgrads, nvtx_label=None):
         """Protocol: reduce-scatter the group's freshly computed weight grad(s)."""
@@ -2309,15 +2328,7 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def forward(ctx, weight):
         """All-gather the full embedding weight across the GTP group for the lookup."""
         ctx.save_for_backward(weight)
-        result = weight.all_gather_and_prefetch(fwd=True)
-        runtime_profiler = get_gtp_runtime_profiler()
-        if runtime_profiler is not None and runtime_profiler.active:
-            runtime_profiler.compute_start(
-                weight._debug_name,
-                _runtime_profile_phase(True),
-                torch.cuda.current_stream(),
-            )
-        return result
+        return weight.all_gather_and_prefetch(fwd=True)
 
     @staticmethod
     def backward(ctx, grad_output):

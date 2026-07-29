@@ -4,8 +4,10 @@
 
 from .model import (
     GTPCudaSample,
+    GTPCommDomain,
     GTPDependency,
     GTPExecutionModel,
+    GTPModuleInfo,
     GTPPhase,
     GTPProfileKey,
     GTPTimingStatistics,
@@ -24,8 +26,10 @@ from .runtime import (
 __all__ = [
     "GTPCudaEventRecorder",
     "GTPCudaSample",
+    "GTPCommDomain",
     "GTPDependency",
     "GTPExecutionModel",
+    "GTPModuleInfo",
     "GTPPhase",
     "GTPProfileKey",
     "GTPProfileToken",

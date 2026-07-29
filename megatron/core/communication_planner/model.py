@@ -2,10 +2,9 @@
 
 """Compact GTP execution model built from eager CUDA profiling.
 
-The model intentionally represents only the fixed GTP scheduling problem:
-ordered module compute, the AG required by each module, and the RS made ready
-by backward compute. RS is a side branch and never orders the next backward
-module.
+The model represents ordered GTP consumers, their AG/materialization and RS,
+and the non-overlapping coarse compute element between consecutive consumers.
+RS is a side branch and never orders the next backward module.
 """
 
 from __future__ import annotations
@@ -31,8 +30,34 @@ class GTPWorkKind(str, Enum):
     """Profiled work represented by the compact model."""
 
     COMPUTE = "compute"
+    COMPUTE_ELEMENT = "compute_element"
+    MATERIALIZE = "materialize"
     AG = "ag"
     RS = "rs"
+
+
+class GTPCommDomain(str, Enum):
+    """Communication domain used by one GTP operation."""
+
+    GTP = "gtp"
+    EGTP = "egtp"
+
+
+@dataclass(frozen=True)
+class GTPModuleInfo:
+    """Coarse model module containing a GTP parameter."""
+
+    scope: str
+    symbol: str
+    layer_number: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.scope:
+            raise ValueError("module scope must be non-empty")
+        if not self.symbol:
+            raise ValueError("module symbol must be non-empty")
+        if self.layer_number is not None and self.layer_number < 1:
+            raise ValueError("layer_number must be positive")
 
 
 @dataclass(frozen=True, order=True)
@@ -43,6 +68,7 @@ class GTPProfileKey:
     phase: GTPPhase
     kind: GTPWorkKind
     occurrence: int = 0
+    domain: GTPCommDomain = GTPCommDomain.GTP
 
     def __post_init__(self) -> None:
         if not self.scope:
@@ -56,7 +82,10 @@ class GTPProfileKey:
     def stable_key(self) -> str:
         """Deterministic string used in runtime artifacts."""
 
-        return f"{self.phase.value}:{self.scope}:{self.kind.value}:{self.occurrence}"
+        return (
+            f"{self.phase.value}:{self.domain.value}:{self.scope}:"
+            f"{self.kind.value}:{self.occurrence}"
+        )
 
 
 @dataclass(frozen=True)
@@ -129,6 +158,8 @@ class GTPExecutionModel:
         phase_orders: Mapping[GTPPhase, Iterable[GTPProfileKey]],
         samples: Iterable[GTPCudaSample],
         parameter_chains: Mapping[str, Iterable[str]] | None = None,
+        parameter_modules: Mapping[str, GTPModuleInfo] | None = None,
+        compute_element_targets: Mapping[GTPProfileKey, GTPProfileKey] | None = None,
     ) -> None:
         orders = {}
         for phase, order in phase_orders.items():
@@ -164,6 +195,18 @@ class GTPExecutionModel:
                 for name, scopes in sorted((parameter_chains or {}).items())
             }
         )
+        self.parameter_modules: Mapping[str, GTPModuleInfo] = MappingProxyType(
+            dict(sorted((parameter_modules or {}).items()))
+        )
+        targets = dict(compute_element_targets or {})
+        for element, target in targets.items():
+            if element.kind is not GTPWorkKind.COMPUTE_ELEMENT:
+                raise ValueError("compute element target source must be a compute element")
+            if target.kind is not GTPWorkKind.MATERIALIZE:
+                raise ValueError("compute element target must be a materialize operation")
+        self.compute_element_targets: Mapping[GTPProfileKey, GTPProfileKey] = (
+            MappingProxyType(targets)
+        )
         self.dependencies = self._build_dependencies()
 
     def _build_dependencies(self) -> tuple[GTPDependency, ...]:
@@ -173,11 +216,23 @@ class GTPExecutionModel:
             for previous, current in zip(order, order[1:]):
                 dependencies.add(GTPDependency(previous, current, "compute_order"))
             for compute in order:
+                materialize = GTPProfileKey(
+                    scope=compute.scope,
+                    phase=phase,
+                    kind=GTPWorkKind.MATERIALIZE,
+                    occurrence=compute.occurrence,
+                    domain=compute.domain,
+                )
+                if materialize in available:
+                    dependencies.add(
+                        GTPDependency(materialize, compute, "materialize_before_compute")
+                    )
                 ag = GTPProfileKey(
                     scope=compute.scope,
                     phase=phase,
                     kind=GTPWorkKind.AG,
                     occurrence=compute.occurrence,
+                    domain=compute.domain,
                 )
                 if ag in available:
                     dependencies.add(GTPDependency(ag, compute, "ag_before_compute"))
@@ -187,9 +242,15 @@ class GTPExecutionModel:
                         phase=phase,
                         kind=GTPWorkKind.RS,
                         occurrence=compute.occurrence,
+                        domain=compute.domain,
                     )
                     if rs in available:
                         dependencies.add(GTPDependency(compute, rs, "compute_before_rs"))
+        for element, target in self.compute_element_targets.items():
+            if element in available and target in available:
+                dependencies.add(
+                    GTPDependency(element, target, "compute_before_materialize")
+                )
         return tuple(
             sorted(
                 dependencies,
@@ -200,8 +261,46 @@ class GTPExecutionModel:
     def to_dict(self) -> dict[str, Any]:
         """Serialize the compact model as a deterministic JSON-compatible object."""
 
+        operations = []
+        for key, stats in self.statistics.items():
+            operation = {
+                "id": key.stable_key,
+                "scope": key.scope,
+                "phase": key.phase.value,
+                "kind": key.kind.value,
+                "occurrence": key.occurrence,
+                "communication_domain": key.domain.value,
+                "cuda_duration": {
+                    "count": stats.count,
+                    "p50_us": stats.p50_us,
+                    "p95_us": stats.p95_us,
+                    "max_us": stats.max_us,
+                },
+            }
+            module = self.parameter_modules.get(key.scope)
+            if module is not None:
+                operation["module"] = _module_info_to_dict(module)
+            target = self.compute_element_targets.get(key)
+            if target is not None:
+                target_module = self.parameter_modules.get(target.scope)
+                operation["next_consumer"] = {
+                    "id": target.stable_key,
+                    "scope": target.scope,
+                    "module": (
+                        _module_info_to_dict(target_module)
+                        if target_module is not None
+                        else None
+                    ),
+                    "crosses_module_boundary": (
+                        module is not None
+                        and target_module is not None
+                        and module.scope != target_module.scope
+                    ),
+                }
+            operations.append(operation)
+
         return {
-            "format_version": 1,
+            "format_version": 3,
             "phase_orders": {
                 phase.value: [key.stable_key for key in order]
                 for phase, order in self.phase_orders.items()
@@ -209,22 +308,14 @@ class GTPExecutionModel:
             "parameter_chains": {
                 name: list(scopes) for name, scopes in self.parameter_chains.items()
             },
-            "operations": [
-                {
-                    "id": key.stable_key,
-                    "scope": key.scope,
-                    "phase": key.phase.value,
-                    "kind": key.kind.value,
-                    "occurrence": key.occurrence,
-                    "cuda_duration": {
-                        "count": stats.count,
-                        "p50_us": stats.p50_us,
-                        "p95_us": stats.p95_us,
-                        "max_us": stats.max_us,
-                    },
-                }
-                for key, stats in self.statistics.items()
+            "parameter_modules": {
+                scope: _module_info_to_dict(module)
+                for scope, module in self.parameter_modules.items()
+            },
+            "compute_element_order": [
+                key.stable_key for key in self.compute_element_targets
             ],
+            "operations": operations,
             "dependencies": [
                 {
                     "src": dependency.src.stable_key,
@@ -234,3 +325,11 @@ class GTPExecutionModel:
                 for dependency in self.dependencies
             ],
         }
+
+
+def _module_info_to_dict(module: GTPModuleInfo) -> dict[str, Any]:
+    return {
+        "scope": module.scope,
+        "symbol": module.symbol,
+        "layer_number": module.layer_number,
+    }

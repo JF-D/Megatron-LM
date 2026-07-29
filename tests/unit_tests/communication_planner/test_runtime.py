@@ -6,6 +6,7 @@ import math
 import megatron.core.communication_planner.runtime as runtime_module
 from megatron.core.communication_planner import (
     GTPCudaEventRecorder,
+    GTPCommDomain,
     GTPPhase,
     GTPRuntimeProfileConfig,
     GTPRuntimeProfiler,
@@ -124,15 +125,32 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
 
     artifact = tmp_path / "rank00000_gtp_execution_model.json"
     payload = json.loads(artifact.read_text())
+    assert payload["format_version"] == 3
     assert payload["diagnostics"]["timing_source"] == "cuda_events"
     assert payload["diagnostics"]["trace_file"] == "rank00000_gtp_execution_trace.json"
+    assert payload["diagnostics"]["consumer_count"] == 2
+    assert payload["diagnostics"]["compute_element_count"] == 1
+    assert {
+        operation["communication_domain"] for operation in payload["operations"]
+    } == {"gtp"}
     assert {
         dependency["kind"] for dependency in payload["dependencies"]
-    } == {"ag_before_compute", "compute_before_rs"}
+    } == {
+        "ag_before_compute",
+        "compute_before_materialize",
+        "compute_before_rs",
+        "materialize_before_compute",
+    }
 
     trace = json.loads((tmp_path / payload["diagnostics"]["trace_file"]).read_text())
     spans = [event for event in trace["traceEvents"] if event["ph"] == "X"]
-    assert {event["args"]["kind"] for event in spans} == {"compute", "ag", "rs"}
+    assert {event["args"]["kind"] for event in spans} == {
+        "compute_element",
+        "materialize",
+        "compute",
+        "ag",
+        "rs",
+    }
     assert sum(event["ph"] == "s" for event in trace["traceEvents"]) == 3
     assert not any("finalize" in event["name"] or "bucket" in event["name"] for event in spans)
     assert profiler.complete
@@ -140,6 +158,57 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
     assert module.handles[0][1].removed
     profiler.begin_iteration(8, _FakeStream(21.0))
     assert not profiler.active
+
+
+def test_compute_element_captures_work_until_next_consumer(tmp_path):
+    profiler = GTPRuntimeProfiler(
+        GTPRuntimeProfileConfig(warmup_iters=0, profile_iters=1, log_dir=tmp_path),
+        _recorder(),
+    )
+    profiler.begin_iteration(4, _FakeStream(0.0))
+
+    first_ready = profiler.consumer_ready(
+        "mamba.in_proj",
+        GTPPhase.FORWARD,
+        _FakeStream(1.0),
+    )
+    profiler.compute_start(
+        "mamba.in_proj",
+        GTPPhase.FORWARD,
+        _FakeStream(2.0),
+        materialize_token=first_ready,
+    )
+    profiler.forward_compute_end("mamba.in_proj", _FakeStream(3.0))
+    second_ready = profiler.consumer_ready(
+        "mamba.out_proj",
+        GTPPhase.FORWARD,
+        _FakeStream(8.0),
+    )
+    profiler.compute_start(
+        "mamba.out_proj",
+        GTPPhase.FORWARD,
+        _FakeStream(9.0),
+        materialize_token=second_ready,
+    )
+    profiler.forward_compute_end("mamba.out_proj", _FakeStream(10.0))
+    profiler.end_iteration(_FakeStream(11.0))
+    model = profiler.build_model()
+
+    element = next(
+        key
+        for key in model.statistics
+        if key.scope == "mamba.in_proj"
+        and key.kind is GTPWorkKind.COMPUTE_ELEMENT
+    )
+    materialize = next(
+        key
+        for key in model.statistics
+        if key.scope == "mamba.out_proj"
+        and key.kind is GTPWorkKind.MATERIALIZE
+    )
+    assert math.isclose(model.statistics[element].p50_us, 6000.0)
+    assert math.isclose(model.statistics[materialize].p50_us, 1000.0)
+    assert model.compute_element_targets[element] == materialize
 
 
 def test_unfinished_compute_aborts_profile_instead_of_extending_to_iteration_end(tmp_path):
@@ -167,6 +236,7 @@ def test_attach_model_profiles_only_the_routed_expert_group_leader(tmp_path):
 
     assert profiler.attach_model(module) == 1
     assert profiler._parameters == {"experts.weight0": leader}
+    assert profiler._communication_domains == {"experts.weight0": GTPCommDomain.EGTP}
     assert len(module.handles) == 1
 
 
@@ -195,6 +265,9 @@ def test_embedding_hooks_capture_direct_gradient_backward_compute(tmp_path):
         _recorder(),
     )
     assert profiler.attach_model(module) == 1
+    assert profiler._communication_domains == {
+        "embedding.weight": GTPCommDomain.GTP
+    }
     assert len(module.handles) == 1
     assert len(module.backward_pre_handles) == 1
 
@@ -223,3 +296,41 @@ def test_embedding_hooks_capture_direct_gradient_backward_compute(tmp_path):
     assert math.isclose(compute[GTPPhase.FORWARD], 2000.0)
     assert math.isclose(compute[GTPPhase.BACKWARD], 3000.0)
     assert not profiler.errors
+
+
+def test_hybrid_module_symbols_label_gtp_parameters():
+    mamba_weight = _FakeParameter("decoder.layers.0.mixer.in_proj.weight")
+    attention_weight = _FakeParameter("decoder.layers.1.self_attention.qkv.weight")
+    expert_weight = _FakeParameter("decoder.layers.2.mlp.experts.weight0", expert_idx=0)
+    mamba_layer = _FakeModule([mamba_weight])
+    attention_layer = _FakeModule([attention_weight])
+    expert_layer = _FakeModule([expert_weight])
+    mamba_layer.layer_number = 1
+    attention_layer.layer_number = 2
+    expert_layer.layer_number = 3
+
+    class _HybridContainer:
+        layer_type_list = ["M", "*", "E"]
+        layers = [mamba_layer, attention_layer, expert_layer]
+
+    container = _HybridContainer()
+    named_modules = [
+        ("decoder", container),
+        ("decoder.layers.0", mamba_layer),
+        ("decoder.layers.1", attention_layer),
+        ("decoder.layers.2", expert_layer),
+    ]
+    module_names = {
+        id(module): name for name, module in named_modules
+    }
+
+    mapping = runtime_module._hybrid_module_info_by_parameter(
+        named_modules,
+        module_names,
+    )
+
+    assert mapping[id(mamba_weight)].symbol == "M"
+    assert mapping[id(mamba_weight)].layer_number == 1
+    assert mapping[id(attention_weight)].symbol == "*"
+    assert mapping[id(expert_weight)].symbol == "E"
+    assert mapping[id(expert_weight)].scope == "decoder.layers.2"
