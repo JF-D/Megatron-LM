@@ -37,7 +37,9 @@ import torch
 from packaging.version import Version
 
 from megatron.core.communication_planner.model import GTPPhase
-from megatron.core.communication_planner.runtime import get_gtp_runtime_profiler
+from megatron.core.communication_planner.runtime import (
+    get_active_gtp_runtime_profiler,
+)
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -1220,14 +1222,13 @@ class GTPShardedParam(torch.nn.Parameter):
         nvtx_range_push(f"{nvtx_label}.all_gather_weight")
 
         weights = self._weights
-        runtime_profiler = get_gtp_runtime_profiler()
-        profile_active = runtime_profiler is not None and runtime_profiler.active
+        runtime_profiler = get_active_gtp_runtime_profiler()
         runtime_token = (
             runtime_profiler.ag_ready(
                 self._debug_name,
                 _runtime_profile_phase(fwd),
             )
-            if profile_active
+            if runtime_profiler is not None
             else None
         )
 
@@ -1310,7 +1311,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         profile_handle_waited = False
         with ag_ctx:
-            if profile_active:
+            if runtime_profiler is not None:
                 runtime_profiler.communication_start(
                     runtime_token, torch.cuda.current_stream()
                 )
@@ -1335,7 +1336,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 )
                 nvtx_range_pop(f"{nvtx_label}.gtp_ag")
                 results = [weight_total]
-            if profile_active:
+            if runtime_profiler is not None:
                 # An async c10d/TE call may launch work on a backend-owned NCCL stream.
                 # Make the explicit GTP AG stream depend on actual Work completion before
                 # recording the profiling END event. This keeps the compute stream
@@ -1468,11 +1469,10 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
-        runtime_profiler = get_gtp_runtime_profiler()
-        profile_active = runtime_profiler is not None and runtime_profiler.active
+        runtime_profiler = get_active_gtp_runtime_profiler()
         consumer_wait_token = None
         issue_gap_token = None
-        if profile_active:
+        if runtime_profiler is not None:
             consumer_wait_token = runtime_profiler.consumer_enter(
                 self._debug_name,
                 GTPPhase.BACKWARD,
@@ -1484,7 +1484,7 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             result = self._all_gather_weight_on_demand(False)
 
-        if profile_active:
+        if runtime_profiler is not None:
             issue_gap_token = runtime_profiler.weight_ready(
                 consumer_wait_token,
                 torch.cuda.current_stream(),
@@ -1513,7 +1513,7 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 cache.release(w._ag_ticket_bwd)
 
-        if profile_active:
+        if runtime_profiler is not None:
             runtime_profiler.compute_start(
                 self._debug_name,
                 GTPPhase.BACKWARD,
@@ -1533,12 +1533,11 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
-        runtime_profiler = get_gtp_runtime_profiler()
-        profile_active = runtime_profiler is not None and runtime_profiler.active
+        runtime_profiler = get_active_gtp_runtime_profiler()
         profile_phase = None
         consumer_wait_token = None
         issue_gap_token = None
-        if profile_active:
+        if runtime_profiler is not None:
             profile_phase = _runtime_profile_phase(fwd)
             consumer_wait_token = runtime_profiler.consumer_enter(
                 self._debug_name,
@@ -1560,7 +1559,7 @@ class GTPShardedParam(torch.nn.Parameter):
             # On-demand: chain head (fwd or recompute global-first) or first-iter build.
             result = self._all_gather_weight_on_demand(True)
 
-        if profile_active:
+        if runtime_profiler is not None:
             issue_gap_token = runtime_profiler.weight_ready(
                 consumer_wait_token,
                 torch.cuda.current_stream(),
@@ -1636,7 +1635,7 @@ class GTPShardedParam(torch.nn.Parameter):
             chain["link_table_flushed"] = True
             log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
 
-        if profile_active:
+        if runtime_profiler is not None:
             assert profile_phase is not None
             runtime_profiler.compute_start(
                 self._debug_name,
@@ -1762,11 +1761,10 @@ class GTPShardedParam(torch.nn.Parameter):
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
-        runtime_profiler = get_gtp_runtime_profiler()
-        profile_active = runtime_profiler is not None and runtime_profiler.active
+        runtime_profiler = get_active_gtp_runtime_profiler()
         runtime_token = (
             runtime_profiler.rs_ready(self._debug_name, torch.cuda.current_stream())
-            if profile_active
+            if runtime_profiler is not None
             else None
         )
 
@@ -1810,7 +1808,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         profile_handle_waited = False
         with rs_ctx:
-            if profile_active:
+            if runtime_profiler is not None:
                 runtime_profiler.communication_start(
                     runtime_token, torch.cuda.current_stream()
                 )
@@ -1834,7 +1832,7 @@ class GTPShardedParam(torch.nn.Parameter):
                         outputs.append(out)
                 nvtx_range_pop(f"{nvtx_label}.batched_gtp_rs")
                 handle = cm if async_op else None
-            if profile_active:
+            if runtime_profiler is not None:
                 # See the AG path: fence actual async Work completion on the dedicated
                 # RS stream before recording END, without blocking the compute stream.
                 if async_op and runtime_profiler.recording and handle is not None:

@@ -34,6 +34,21 @@ class _FakeEvent:
         return other.time_ms - self.time_ms
 
 
+class _ControllableEventFactory:
+    def __init__(self):
+        self.events = []
+
+    def __call__(self):
+        event = _FakeEvent()
+        event.complete = False
+        self.events.append(event)
+        return event
+
+    def complete_all(self):
+        for event in self.events:
+            event.complete = True
+
+
 def _recorder():
     return GTPCudaEventRecorder(_FakeEvent)
 
@@ -127,6 +142,9 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
     payload = json.loads(artifact.read_text())
     assert payload["format_version"] == 4
     assert payload["diagnostics"]["timing_source"] == "cuda_events"
+    assert payload["diagnostics"]["warmup_iterations_configured"] == 0
+    assert payload["diagnostics"]["profile_iterations_configured"] == 1
+    assert payload["diagnostics"]["iterations_observed"] == 1
     assert (
         payload["diagnostics"]["communication_timing"]
         == "work_completion_fenced_on_comm_stream"
@@ -168,6 +186,71 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
     assert module.handles[0][1].removed
     profiler.begin_iteration(8, _FakeStream(21.0))
     assert not profiler.active
+
+
+def test_profiler_stops_after_initial_window_while_cuda_events_drain(tmp_path):
+    event_factory = _ControllableEventFactory()
+    profiler = GTPRuntimeProfiler(
+        GTPRuntimeProfileConfig(warmup_iters=1, profile_iters=1, log_dir=tmp_path),
+        GTPCudaEventRecorder(event_factory),
+    )
+    module = _FakeModule([_FakeParameter("layer.weight")])
+    profiler.attach_model(module)
+
+    def run_forward(iteration, start_ms):
+        with profiler.profile_iteration(iteration, _FakeStream(start_ms)) as active:
+            assert active
+            profiler.compute_start(
+                "layer.weight",
+                GTPPhase.FORWARD,
+                _FakeStream(start_ms + 1.0),
+            )
+            profiler.forward_compute_end(
+                "layer.weight",
+                _FakeStream(start_ms + 2.0),
+            )
+
+    run_forward(10, 0.0)
+    assert not profiler.window_closed
+    assert not module.handles[0][1].removed
+
+    run_forward(11, 10.0)
+    reference_orders = profiler._reference_orders
+    assert profiler.window_closed
+    assert not profiler.complete
+    assert profiler.recorder.pending_iterations == 1
+    assert module.handles[0][1].removed
+
+    assert not profiler.begin_iteration(12, _FakeStream(20.0))
+    assert not profiler.active
+    assert profiler._reference_orders == reference_orders
+    assert profiler.ag_ready("layer.weight", GTPPhase.FORWARD) is None
+
+    event_factory.complete_all()
+    assert not profiler.begin_iteration(13, _FakeStream(30.0))
+    assert profiler.complete
+    assert profiler._iteration_ordinal == 2
+    assert (tmp_path / "rank00000_gtp_execution_model.json").exists()
+
+
+def test_process_global_profiler_is_visible_only_inside_profile_iteration(tmp_path):
+    runtime_module.reset_gtp_runtime_profiler()
+    try:
+        profiler = runtime_module.configure_gtp_runtime_profiler(
+            GTPRuntimeProfileConfig(
+                warmup_iters=0,
+                profile_iters=1,
+                log_dir=tmp_path,
+            ),
+            recorder=_recorder(),
+        )
+        assert runtime_module.get_active_gtp_runtime_profiler() is None
+        with profiler.profile_iteration(1, _FakeStream(0.0)):
+            assert runtime_module.get_active_gtp_runtime_profiler() is profiler
+        assert runtime_module.get_active_gtp_runtime_profiler() is None
+        assert profiler.complete
+    finally:
+        runtime_module.reset_gtp_runtime_profiler()
 
 
 def test_compute_element_splits_current_wait_from_prefetch_issue_gap(tmp_path):

@@ -3725,6 +3725,10 @@ def train(
 
     # Run training iterations till done.
     buffered_rollouts = None
+    from megatron.core.communication_planner import get_gtp_runtime_profiler
+
+    configured_gtp_runtime_profiler = get_gtp_runtime_profiler()
+    gtp_runtime_profiler = configured_gtp_runtime_profiler
     while iteration < args.train_iters:
         if (args.profile
             and (len(args.profile_ranks) == 0 or
@@ -3847,12 +3851,12 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
-            from megatron.core.communication_planner import get_gtp_runtime_profiler
-
-            gtp_runtime_profiler = get_gtp_runtime_profiler()
-            if gtp_runtime_profiler is not None:
-                gtp_runtime_profiler.begin_iteration(iteration)
-            try:
+            runtime_profile_context = (
+                gtp_runtime_profiler.profile_iteration(iteration)
+                if gtp_runtime_profiler is not None
+                else nullcontext()
+            )
+            with runtime_profile_context:
                 (
                     loss_dict,
                     skipped_iter,
@@ -3874,9 +3878,8 @@ def train(
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                 )
-            finally:
-                if gtp_runtime_profiler is not None:
-                    gtp_runtime_profiler.end_iteration()
+            if gtp_runtime_profiler is not None and gtp_runtime_profiler.complete:
+                gtp_runtime_profiler = None
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
@@ -4129,11 +4132,8 @@ def train(
     if writer:
         writer.flush()
 
-    from megatron.core.communication_planner import get_gtp_runtime_profiler
-
-    gtp_runtime_profiler = get_gtp_runtime_profiler()
-    if gtp_runtime_profiler is not None:
-        gtp_runtime_profiler.finalize()
+    if configured_gtp_runtime_profiler is not None:
+        configured_gtp_runtime_profiler.finalize()
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:

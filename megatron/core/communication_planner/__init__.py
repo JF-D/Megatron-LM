@@ -19,6 +19,7 @@ from .runtime import (
     GTPRuntimeProfileConfig,
     GTPRuntimeProfiler,
     configure_gtp_runtime_profiler,
+    get_active_gtp_runtime_profiler,
     get_gtp_runtime_profiler,
     reset_gtp_runtime_profiler,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "GTPTimingStatistics",
     "GTPWorkKind",
     "configure_gtp_runtime_profiler",
+    "get_active_gtp_runtime_profiler",
     "get_gtp_runtime_profiler",
     "reset_gtp_runtime_profiler",
 ]

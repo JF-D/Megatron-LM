@@ -121,12 +121,19 @@ boundary inspection. It renders coarse compute elements, consumer wait,
 prefetch-issue gaps, direct GTP consumer compute, AG, and RS. It draws only
 `ag_before_compute` and `compute_before_rs` flows to keep the view readable.
 
-Profiling cost is bounded by the configured sample count. Each observed compute,
-compute element, opportunity interval, AG, or RS uses two timing events; the
-final consumer has no compute-element end and its provisional event is
-discarded. Raw CUDA kernels, CPU operators, and generic resource-conflict nodes
-are not collected. Completed samples are reduced to duration statistics, and
-all module hooks are removed after the artifact is written.
+Semantic instrumentation is active for exactly
+`warmup_iters + profile_iters` initial training iterations. At the end of that
+window, module hooks are removed immediately and later iterations do not build
+tokens or execution order. Incomplete CUDA event sets drain asynchronously and
+the artifact is written once they complete; only training teardown may use a
+final CUDA synchronization.
+
+Profiling cost is therefore bounded by the configured initial window. Each
+observed compute, compute element, opportunity interval, AG, or RS uses two
+timing events; the final consumer has no compute-element end and its
+provisional event is discarded. Raw CUDA kernels, CPU operators, and generic
+resource-conflict nodes are not collected. Completed samples are reduced to
+duration statistics.
 
 The next step consumes this model to generate per-`GTPShardedParam` forward
 prefetch counts, backward prefetch counts, and RS issue/hold counts.

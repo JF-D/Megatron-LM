@@ -2962,19 +2962,19 @@ def _add_distributed_args(parser):
     group.add_argument(
         '--gtp-runtime-profile',
         action='store_true',
-        help='Collect a bounded CUDA-event profile of the eager GTP execution chain.',
+        help='Collect an initial, bounded CUDA-event profile of the eager GTP execution chain.',
     )
     group.add_argument(
         '--gtp-runtime-profile-warmup-iters',
         type=int,
         default=2,
-        help='Number of eager iterations before GTP CUDA-event profiling begins.',
+        help='Number of initial eager iterations used for untimed GTP graph discovery.',
     )
     group.add_argument(
         '--gtp-runtime-profile-iters',
         type=int,
         default=4,
-        help='Number of eager iterations included in the compact GTP execution model.',
+        help='Number of eager iterations recorded after initial GTP graph discovery.',
     )
     group.add_argument(
         '--gtp-runtime-profile-log-dir',

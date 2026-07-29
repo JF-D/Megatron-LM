@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -26,6 +27,13 @@ from .trace import build_gtp_chrome_trace
 class _CudaMarker(str, Enum):
     START = "start"
     END = "end"
+
+
+class _RuntimeProfileState(str, Enum):
+    DISCOVERY = "discovery"
+    RECORDING = "recording"
+    DRAINING = "draining"
+    COMPLETE = "complete"
 
 
 @dataclass(frozen=True)
@@ -183,6 +191,11 @@ class GTPRuntimeProfiler:
     ) -> None:
         self.config = config
         self.recorder = recorder or GTPCudaEventRecorder()
+        self._state = (
+            _RuntimeProfileState.DISCOVERY
+            if config.warmup_iters > 0
+            else _RuntimeProfileState.RECORDING
+        )
         self._iteration_ordinal = 0
         self._profile_started = 0
         self._recording = False
@@ -211,6 +224,7 @@ class GTPRuntimeProfiler:
         self._communication_domains: dict[str, GTPCommDomain] = {}
         self._parameter_modules: dict[str, GTPModuleInfo] = {}
         self._dumped = False
+        self._artifact_path: Path | None = None
 
     @property
     def active(self) -> bool:
@@ -226,9 +240,18 @@ class GTPRuntimeProfiler:
 
     @property
     def complete(self) -> bool:
-        """Whether the bounded model artifact has been written."""
+        """Whether the bounded profiling lifecycle has finished."""
 
-        return self._dumped
+        return self._state is _RuntimeProfileState.COMPLETE
+
+    @property
+    def window_closed(self) -> bool:
+        """Whether discovery and event recording have permanently stopped."""
+
+        return self._state in {
+            _RuntimeProfileState.DRAINING,
+            _RuntimeProfileState.COMPLETE,
+        }
 
     @property
     def errors(self) -> tuple[str, ...]:
@@ -332,11 +355,12 @@ class GTPRuntimeProfiler:
                     )
         return len(attached_modules)
 
-    def begin_iteration(self, iteration: int, stream: object | None = None) -> None:
-        """Begin discovery or one bounded CUDA-profile iteration."""
+    def begin_iteration(self, iteration: int, stream: object | None = None) -> bool:
+        """Begin one iteration inside the bounded discovery/profile window."""
 
-        if self._dumped:
-            return
+        self.collect_completed()
+        if self.window_closed:
+            return False
         if self._active_iteration is not None:
             raise RuntimeError(f"Iteration {self._active_iteration} is still active")
         self._active_iteration = iteration
@@ -347,13 +371,24 @@ class GTPRuntimeProfiler:
         self._pending_prefetch_issue_gap = defaultdict(list)
         self._current_orders = defaultdict(list)
         self._current_compute_element_targets = {}
-        self._recording = (
-            self._iteration_ordinal >= self.config.warmup_iters
-            and self._profile_started < self.config.profile_iters
-        )
+        self._recording = self._state is _RuntimeProfileState.RECORDING
         if self._recording:
             self.recorder.begin_iteration(iteration, stream)
             self._profile_started += 1
+        return True
+
+    @contextmanager
+    def profile_iteration(
+        self, iteration: int, stream: object | None = None
+    ) -> Iterator[bool]:
+        """Scope profiler activation to one training iteration."""
+
+        active = self.begin_iteration(iteration, stream)
+        try:
+            yield active
+        finally:
+            if active:
+                self.end_iteration(stream)
 
     def end_iteration(self, stream: object | None = None) -> None:
         """Close one iteration and asynchronously collect prior CUDA samples."""
@@ -426,6 +461,7 @@ class GTPRuntimeProfiler:
         self._active_iteration = None
         self._recording = False
         self._iteration_ordinal += 1
+        self._advance_window()
         self.collect_completed()
 
     def collect_completed(self) -> tuple[tuple[int, tuple[GTPCudaSample, ...]], ...]:
@@ -434,21 +470,28 @@ class GTPRuntimeProfiler:
         completed = self.recorder.collect_completed()
         for _, samples in completed:
             self._samples.extend(samples)
-        if self._profile_started >= self.config.profile_iters and not self.recorder.pending_iterations:
-            self._dump_model()
+        if (
+            self._state is _RuntimeProfileState.DRAINING
+            and not self.recorder.pending_iterations
+        ):
+            self._artifact_path = self._dump_model()
+            self._state = _RuntimeProfileState.COMPLETE
         return completed
 
     def finalize(self, *, synchronize: bool = True) -> Path | None:
         """Collect final samples, optionally synchronizing once after training."""
 
+        if self._active_iteration is not None:
+            raise RuntimeError(
+                f"Cannot finalize while iteration {self._active_iteration} is active"
+            )
+        self._close_window()
         if synchronize and self.recorder.pending_iterations:
             import torch
 
             torch.cuda.synchronize()
         self.collect_completed()
-        path = self._dump_model()
-        self._remove_hooks()
-        return path
+        return self._artifact_path
 
     def ag_ready(
         self,
@@ -726,8 +769,30 @@ class GTPRuntimeProfiler:
             chains[f"{chain_id}:{head_scope}"] = tuple(scopes)
         return chains
 
+    def _advance_window(self) -> None:
+        """Advance the bounded profiler after one observed training iteration."""
+
+        total_iterations = self.config.warmup_iters + self.config.profile_iters
+        if self._iteration_ordinal >= total_iterations:
+            self._close_window()
+        elif self._iteration_ordinal >= self.config.warmup_iters:
+            self._state = _RuntimeProfileState.RECORDING
+
+    def _close_window(self) -> None:
+        """Stop semantic instrumentation while completed CUDA events drain."""
+
+        if self._state in {
+            _RuntimeProfileState.DRAINING,
+            _RuntimeProfileState.COMPLETE,
+        }:
+            return
+        self._state = _RuntimeProfileState.DRAINING
+        self._remove_hooks()
+
     def _dump_model(self) -> Path | None:
-        if self._dumped or not self._samples or not self._reference_orders:
+        if self._dumped:
+            return self._artifact_path
+        if not self._samples or not self._reference_orders:
             return None
         model = self.build_model()
         payload = model.to_dict()
@@ -735,6 +800,9 @@ class GTPRuntimeProfiler:
         self._errors.extend(error for error in chain_errors if error not in self._errors)
         payload["diagnostics"] = {
             "errors": list(self._errors),
+            "warmup_iterations_configured": self.config.warmup_iters,
+            "profile_iterations_configured": self.config.profile_iters,
+            "iterations_observed": self._iteration_ordinal,
             "profile_iterations_started": self._profile_started,
             "sample_count": len(self._samples),
             "consumer_count": sum(
@@ -772,7 +840,7 @@ class GTPRuntimeProfiler:
             )
             stream.write("\n")
         self._dumped = True
-        self._remove_hooks()
+        self._artifact_path = path
         return path
 
     def _remove_hooks(self) -> None:
@@ -831,6 +899,13 @@ def get_gtp_runtime_profiler() -> GTPRuntimeProfiler | None:
     """Return the configured profiler, or ``None`` when profiling is disabled."""
 
     return _RUNTIME_PROFILER
+
+
+def get_active_gtp_runtime_profiler() -> GTPRuntimeProfiler | None:
+    """Return the profiler only while a bounded semantic iteration is active."""
+
+    profiler = _RUNTIME_PROFILER
+    return profiler if profiler is not None and profiler.active else None
 
 
 def reset_gtp_runtime_profiler() -> None:
