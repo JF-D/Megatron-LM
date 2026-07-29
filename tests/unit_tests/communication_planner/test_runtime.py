@@ -125,8 +125,16 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
 
     artifact = tmp_path / "rank00000_gtp_execution_model.json"
     payload = json.loads(artifact.read_text())
-    assert payload["format_version"] == 3
+    assert payload["format_version"] == 4
     assert payload["diagnostics"]["timing_source"] == "cuda_events"
+    assert (
+        payload["diagnostics"]["communication_timing"]
+        == "work_completion_fenced_on_comm_stream"
+    )
+    assert payload["diagnostics"]["opportunity_intervals"] == [
+        "consumer_wait",
+        "prefetch_issue_gap",
+    ]
     assert payload["diagnostics"]["trace_file"] == "rank00000_gtp_execution_trace.json"
     assert payload["diagnostics"]["consumer_count"] == 2
     assert payload["diagnostics"]["compute_element_count"] == 1
@@ -137,16 +145,18 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
         dependency["kind"] for dependency in payload["dependencies"]
     } == {
         "ag_before_compute",
-        "compute_before_materialize",
+        "compute_before_consumer_wait",
         "compute_before_rs",
-        "materialize_before_compute",
+        "consumer_wait_before_prefetch_issue",
+        "prefetch_issue_before_compute",
     }
 
     trace = json.loads((tmp_path / payload["diagnostics"]["trace_file"]).read_text())
     spans = [event for event in trace["traceEvents"] if event["ph"] == "X"]
     assert {event["args"]["kind"] for event in spans} == {
         "compute_element",
-        "materialize",
+        "consumer_wait",
+        "prefetch_issue_gap",
         "compute",
         "ag",
         "rs",
@@ -160,35 +170,37 @@ def test_runtime_profiler_builds_cuda_model_and_closes_forward_explicitly(tmp_pa
     assert not profiler.active
 
 
-def test_compute_element_captures_work_until_next_consumer(tmp_path):
+def test_compute_element_splits_current_wait_from_prefetch_issue_gap(tmp_path):
     profiler = GTPRuntimeProfiler(
         GTPRuntimeProfileConfig(warmup_iters=0, profile_iters=1, log_dir=tmp_path),
         _recorder(),
     )
     profiler.begin_iteration(4, _FakeStream(0.0))
 
-    first_ready = profiler.consumer_ready(
+    first_wait = profiler.consumer_enter(
         "mamba.in_proj",
         GTPPhase.FORWARD,
         _FakeStream(1.0),
     )
+    first_issue_gap = profiler.weight_ready(first_wait, _FakeStream(1.1))
     profiler.compute_start(
         "mamba.in_proj",
         GTPPhase.FORWARD,
         _FakeStream(2.0),
-        materialize_token=first_ready,
+        issue_gap_token=first_issue_gap,
     )
     profiler.forward_compute_end("mamba.in_proj", _FakeStream(3.0))
-    second_ready = profiler.consumer_ready(
+    second_wait = profiler.consumer_enter(
         "mamba.out_proj",
         GTPPhase.FORWARD,
         _FakeStream(8.0),
     )
+    second_issue_gap = profiler.weight_ready(second_wait, _FakeStream(8.01))
     profiler.compute_start(
         "mamba.out_proj",
         GTPPhase.FORWARD,
         _FakeStream(9.0),
-        materialize_token=second_ready,
+        issue_gap_token=second_issue_gap,
     )
     profiler.forward_compute_end("mamba.out_proj", _FakeStream(10.0))
     profiler.end_iteration(_FakeStream(11.0))
@@ -200,15 +212,22 @@ def test_compute_element_captures_work_until_next_consumer(tmp_path):
         if key.scope == "mamba.in_proj"
         and key.kind is GTPWorkKind.COMPUTE_ELEMENT
     )
-    materialize = next(
+    consumer_wait = next(
         key
         for key in model.statistics
         if key.scope == "mamba.out_proj"
-        and key.kind is GTPWorkKind.MATERIALIZE
+        and key.kind is GTPWorkKind.CONSUMER_WAIT
+    )
+    issue_gap = next(
+        key
+        for key in model.statistics
+        if key.scope == "mamba.out_proj"
+        and key.kind is GTPWorkKind.PREFETCH_ISSUE_GAP
     )
     assert math.isclose(model.statistics[element].p50_us, 6000.0)
-    assert math.isclose(model.statistics[materialize].p50_us, 1000.0)
-    assert model.compute_element_targets[element] == materialize
+    assert math.isclose(model.statistics[consumer_wait].p50_us, 10.0)
+    assert math.isclose(model.statistics[issue_gap].p50_us, 990.0)
+    assert model.compute_element_targets[element] == consumer_wait
 
 
 def test_unfinished_compute_aborts_profile_instead_of_extending_to_iteration_end(tmp_path):

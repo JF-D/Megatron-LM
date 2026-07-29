@@ -1308,6 +1308,7 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             ag_ctx = nullcontext()
 
+        profile_handle_waited = False
         with ag_ctx:
             if profile_active:
                 runtime_profiler.communication_start(
@@ -1335,6 +1336,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 nvtx_range_pop(f"{nvtx_label}.gtp_ag")
                 results = [weight_total]
             if profile_active:
+                # An async c10d/TE call may launch work on a backend-owned NCCL stream.
+                # Make the explicit GTP AG stream depend on actual Work completion before
+                # recording the profiling END event. This keeps the compute stream
+                # asynchronous while avoiding an enqueue-only ~2 us communication sample.
+                if async_op and runtime_profiler.recording and handle is not None:
+                    handle.wait()
+                    profile_handle_waited = True
                 runtime_profiler.communication_end(
                     runtime_token, torch.cuda.current_stream()
                 )
@@ -1343,7 +1351,10 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # 6. Wrap handle.
         if async_op:
-            handle = GTPShardHandle(handle, weights)
+            handle = GTPShardHandle(
+                None if profile_handle_waited else handle,
+                weights,
+            )
         else:
             handle = None
 
@@ -1459,9 +1470,10 @@ class GTPShardedParam(torch.nn.Parameter):
         """
         runtime_profiler = get_gtp_runtime_profiler()
         profile_active = runtime_profiler is not None and runtime_profiler.active
-        materialize_token = None
+        consumer_wait_token = None
+        issue_gap_token = None
         if profile_active:
-            materialize_token = runtime_profiler.consumer_ready(
+            consumer_wait_token = runtime_profiler.consumer_enter(
                 self._debug_name,
                 GTPPhase.BACKWARD,
                 torch.cuda.current_stream(),
@@ -1471,6 +1483,12 @@ class GTPShardedParam(torch.nn.Parameter):
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
+
+        if profile_active:
+            issue_gap_token = runtime_profiler.weight_ready(
+                consumer_wait_token,
+                torch.cuda.current_stream(),
+            )
 
         if (
             GTP_CONFIG.weight_prefetch
@@ -1500,7 +1518,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 self._debug_name,
                 GTPPhase.BACKWARD,
                 torch.cuda.current_stream(),
-                materialize_token=materialize_token,
+                issue_gap_token=issue_gap_token,
             )
         return result
 
@@ -1518,10 +1536,11 @@ class GTPShardedParam(torch.nn.Parameter):
         runtime_profiler = get_gtp_runtime_profiler()
         profile_active = runtime_profiler is not None and runtime_profiler.active
         profile_phase = None
-        materialize_token = None
+        consumer_wait_token = None
+        issue_gap_token = None
         if profile_active:
             profile_phase = _runtime_profile_phase(fwd)
-            materialize_token = runtime_profiler.consumer_ready(
+            consumer_wait_token = runtime_profiler.consumer_enter(
                 self._debug_name,
                 profile_phase,
                 torch.cuda.current_stream(),
@@ -1540,6 +1559,12 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             # On-demand: chain head (fwd or recompute global-first) or first-iter build.
             result = self._all_gather_weight_on_demand(True)
+
+        if profile_active:
+            issue_gap_token = runtime_profiler.weight_ready(
+                consumer_wait_token,
+                torch.cuda.current_stream(),
+            )
 
         # Prefetch next weight on the matching chain.
         if (
@@ -1617,7 +1642,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 self._debug_name,
                 profile_phase,
                 torch.cuda.current_stream(),
-                materialize_token=materialize_token,
+                issue_gap_token=issue_gap_token,
             )
         return result
 
@@ -1783,6 +1808,7 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             rs_ctx = nullcontext()
 
+        profile_handle_waited = False
         with rs_ctx:
             if profile_active:
                 runtime_profiler.communication_start(
@@ -1809,10 +1835,17 @@ class GTPShardedParam(torch.nn.Parameter):
                 nvtx_range_pop(f"{nvtx_label}.batched_gtp_rs")
                 handle = cm if async_op else None
             if profile_active:
+                # See the AG path: fence actual async Work completion on the dedicated
+                # RS stream before recording END, without blocking the compute stream.
+                if async_op and runtime_profiler.recording and handle is not None:
+                    handle.wait()
+                    profile_handle_waited = True
                 runtime_profiler.communication_end(
                     runtime_token, torch.cuda.current_stream()
                 )
 
+            if profile_handle_waited:
+                handle = None
             return outputs, handle
 
     def _prepare_wgrad_reduce_scatter_inputs(self, wgrads):

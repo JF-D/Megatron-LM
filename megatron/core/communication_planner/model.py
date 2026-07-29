@@ -2,9 +2,10 @@
 
 """Compact GTP execution model built from eager CUDA profiling.
 
-The model represents ordered GTP consumers, their AG/materialization and RS,
-and the non-overlapping coarse compute element between consecutive consumers.
-RS is a side branch and never orders the next backward module.
+The model represents ordered GTP consumers, their exposed current-weight wait,
+prefetch-issue gap, AG and RS, and the non-overlapping coarse compute element
+between consecutive consumers. RS is a side branch and never orders the next
+backward module.
 """
 
 from __future__ import annotations
@@ -31,7 +32,8 @@ class GTPWorkKind(str, Enum):
 
     COMPUTE = "compute"
     COMPUTE_ELEMENT = "compute_element"
-    MATERIALIZE = "materialize"
+    CONSUMER_WAIT = "consumer_wait"
+    PREFETCH_ISSUE_GAP = "prefetch_issue_gap"
     AG = "ag"
     RS = "rs"
 
@@ -202,8 +204,8 @@ class GTPExecutionModel:
         for element, target in targets.items():
             if element.kind is not GTPWorkKind.COMPUTE_ELEMENT:
                 raise ValueError("compute element target source must be a compute element")
-            if target.kind is not GTPWorkKind.MATERIALIZE:
-                raise ValueError("compute element target must be a materialize operation")
+            if target.kind is not GTPWorkKind.CONSUMER_WAIT:
+                raise ValueError("compute element target must be a consumer-wait operation")
         self.compute_element_targets: Mapping[GTPProfileKey, GTPProfileKey] = (
             MappingProxyType(targets)
         )
@@ -216,16 +218,35 @@ class GTPExecutionModel:
             for previous, current in zip(order, order[1:]):
                 dependencies.add(GTPDependency(previous, current, "compute_order"))
             for compute in order:
-                materialize = GTPProfileKey(
+                consumer_wait = GTPProfileKey(
                     scope=compute.scope,
                     phase=phase,
-                    kind=GTPWorkKind.MATERIALIZE,
+                    kind=GTPWorkKind.CONSUMER_WAIT,
                     occurrence=compute.occurrence,
                     domain=compute.domain,
                 )
-                if materialize in available:
+                issue_gap = GTPProfileKey(
+                    scope=compute.scope,
+                    phase=phase,
+                    kind=GTPWorkKind.PREFETCH_ISSUE_GAP,
+                    occurrence=compute.occurrence,
+                    domain=compute.domain,
+                )
+                if consumer_wait in available and issue_gap in available:
                     dependencies.add(
-                        GTPDependency(materialize, compute, "materialize_before_compute")
+                        GTPDependency(
+                            consumer_wait,
+                            issue_gap,
+                            "consumer_wait_before_prefetch_issue",
+                        )
+                    )
+                if issue_gap in available:
+                    dependencies.add(
+                        GTPDependency(
+                            issue_gap,
+                            compute,
+                            "prefetch_issue_before_compute",
+                        )
                     )
                 ag = GTPProfileKey(
                     scope=compute.scope,
@@ -249,7 +270,7 @@ class GTPExecutionModel:
         for element, target in self.compute_element_targets.items():
             if element in available and target in available:
                 dependencies.add(
-                    GTPDependency(element, target, "compute_before_materialize")
+                    GTPDependency(element, target, "compute_before_consumer_wait")
                 )
         return tuple(
             sorted(
@@ -300,7 +321,7 @@ class GTPExecutionModel:
             operations.append(operation)
 
         return {
-            "format_version": 3,
+            "format_version": 4,
             "phase_orders": {
                 phase.value: [key.stable_key for key in order]
                 for phase, order in self.phase_orders.items()

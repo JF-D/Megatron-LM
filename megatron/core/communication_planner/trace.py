@@ -44,6 +44,18 @@ _LANE_LAYOUT = {
         600,
         "Backward GTP consumer intervals",
     ),
+    (GTPPhase.FORWARD, GTPWorkKind.CONSUMER_WAIT, None): (
+        700,
+        "Forward prefetch opportunities",
+    ),
+    (GTPPhase.RECOMPUTE, GTPWorkKind.CONSUMER_WAIT, None): (
+        800,
+        "Recompute prefetch opportunities",
+    ),
+    (GTPPhase.BACKWARD, GTPWorkKind.CONSUMER_WAIT, None): (
+        900,
+        "Backward prefetch opportunities",
+    ),
     (GTPPhase.FORWARD, GTPWorkKind.AG, GTPCommDomain.GTP): (2000, "Forward GTP AG"),
     (GTPPhase.FORWARD, GTPWorkKind.AG, GTPCommDomain.EGTP): (
         2100,
@@ -78,7 +90,8 @@ _FLOW_DEPENDENCIES = frozenset({"ag_before_compute", "compute_before_rs"})
 _COLORS = {
     GTPWorkKind.COMPUTE: "thread_state_running",
     GTPWorkKind.COMPUTE_ELEMENT: "thread_state_running",
-    GTPWorkKind.MATERIALIZE: "thread_state_iowait",
+    GTPWorkKind.CONSUMER_WAIT: "thread_state_iowait",
+    GTPWorkKind.PREFETCH_ISSUE_GAP: "thread_state_sleeping",
     GTPWorkKind.AG: "rail_response",
     GTPWorkKind.RS: "rail_animation",
 }
@@ -95,13 +108,19 @@ def _pack_lanes(
         tuple[GTPPhase, GTPWorkKind, GTPCommDomain | None], list[GTPCudaSample]
     ] = defaultdict(list)
     for sample in samples:
-        if sample.key.kind in (
-            GTPWorkKind.COMPUTE_ELEMENT,
-            GTPWorkKind.MATERIALIZE,
-        ):
+        if sample.key.kind is GTPWorkKind.COMPUTE_ELEMENT:
             group = (
                 sample.key.phase,
                 GTPWorkKind.COMPUTE_ELEMENT,
+                None,
+            )
+        elif sample.key.kind in (
+            GTPWorkKind.CONSUMER_WAIT,
+            GTPWorkKind.PREFETCH_ISSUE_GAP,
+        ):
+            group = (
+                sample.key.phase,
+                GTPWorkKind.CONSUMER_WAIT,
                 None,
             )
         elif sample.key.kind is GTPWorkKind.COMPUTE:
@@ -243,9 +262,16 @@ def build_gtp_chrome_trace(
                                 "Non-overlapping compute window until the next GTP consumer"
                                 if key.kind is GTPWorkKind.COMPUTE_ELEMENT
                                 else (
-                                    "Exposed current-weight materialization interval"
-                                    if key.kind is GTPWorkKind.MATERIALIZE
-                                    else "CUDA service interval on the GTP communication stream"
+                                    "Exposed wait for the current GTP weight"
+                                    if key.kind is GTPWorkKind.CONSUMER_WAIT
+                                    else (
+                                        "Compute-stream gap while future prefetches are issued"
+                                        if key.kind is GTPWorkKind.PREFETCH_ISSUE_GAP
+                                        else (
+                                            "CUDA service interval on the GTP "
+                                            "communication stream"
+                                        )
+                                    )
                                 )
                             )
                         ),
@@ -296,7 +322,8 @@ def build_gtp_chrome_trace(
             "iterations": sorted(samples_by_iteration),
             "operation_kinds": [
                 "compute_element",
-                "materialize",
+                "consumer_wait",
+                "prefetch_issue_gap",
                 "compute",
                 "ag",
                 "rs",
@@ -304,8 +331,13 @@ def build_gtp_chrome_trace(
             "communication_domains": ["gtp", "egtp"],
             "dependency_kinds": sorted(_FLOW_DEPENDENCIES),
             "compute_element_semantics": (
-                "current consumer compute-start to next consumer-ready; "
-                "includes coarse parameterless work and excludes next materialization"
+                "current consumer compute-start to next consumer-enter; includes "
+                "coarse parameterless work and excludes next consumer wait"
+            ),
+            "opportunity_semantics": (
+                "consumer_wait is unfinished current-weight communication; "
+                "prefetch_issue_gap is a compute-stream bubble while future prefetches "
+                "and bookkeeping are issued"
             ),
         },
     }

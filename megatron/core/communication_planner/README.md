@@ -11,11 +11,11 @@ timing-enabled CUDA events on the streams that execute module compute, AG, and
 RS:
 
 ```text
-consumer i:       AG_i -> materialize_i -> compute_i
-                                      \
-                                       +-> compute_element_i
-                                             |
-                                             +-> materialize_(i+1)
+consumer i:       AG_i -> consumer_wait_i -> prefetch_issue_gap_i -> compute_i
+                                                                  \
+                                                                   +-> compute_element_i
+                                                                         |
+                                                                         +-> consumer_wait_(i+1)
 
 backward:         BWD_AG_i -> B_i
                                 |
@@ -27,12 +27,16 @@ branch whose eventual consumer is gradient finalization, not the next backward
 module.
 
 `compute_element_i` is the non-overlapping CUDA interval from the point where
-consumer `i` has obtained its weight until consumer `i+1` is ready to wait for
-its weight. It therefore includes parameterless activations, mixer/attention
-cores, routing, residuals, normalization, and other coarse work between two
-`GTPShardedParam` consumption points. `materialize_i` separately measures the
-exposed interval from consumer-ready to current-weight-ready, so communication
-waiting is never counted as available computation.
+consumer `i` has issued its planned future prefetches until consumer `i+1`
+enters its weight-consumption path. It therefore includes parameterless
+activations, mixer/attention cores, routing, residuals, normalization, and
+other coarse work between two `GTPShardedParam` consumption points.
+
+`consumer_wait_i` measures only the exposed interval from entering the
+consumer to obtaining its current weight. `prefetch_issue_gap_i` begins as soon
+as that current weight is ready and ends when planned future prefetches and GTP
+bookkeeping have been issued. The latter is a CUDA-visible compute-stream
+bubble, even when its root cause is host launch overhead.
 
 The existing `GTPShardedParam.prev_w` / `next_w` links remain the executable
 parameter chain. The profiler also records the observed forward and backward
@@ -52,12 +56,16 @@ hard-coded execution order.
 
 ## CUDA boundaries
 
-- AG/RS `START` and `END` events are recorded on their actual GTP communication
-  streams around the collective enqueue. An event enqueued after an asynchronous
-  collective completes only after the collective's device work.
-- Consumer-ready is recorded inside `GTPShardedParam.all_gather_and_prefetch`
+- During recorded iterations, asynchronous TE/c10d AG and RS work is fenced on
+  its dedicated GTP communication stream with `Work.wait()` before the timing
+  END event is recorded. This orders END after actual backend completion
+  without making the compute stream wait. Symmetric communication should
+  provide the equivalent stream-ordered ready event directly.
+- Consumer-enter is recorded inside `GTPShardedParam.all_gather_and_prefetch`
   or `all_gather_and_prefetch_bwd` before the current weight is consumed.
-- Compute starts in the same common methods after the current weight is ready.
+- Weight-ready is recorded immediately after the current prefetched weight is
+  obtained or an on-demand AG completes, before any future AG is issued.
+- Compute starts after future prefetches and GTP bookkeeping have been issued.
   This covers TE, legacy MCore linears such as the output layer, and embedding
   without separate forward callsite instrumentation.
 - Forward compute starts after the gathered weight is available and ends in a
@@ -103,21 +111,22 @@ existing parameter chains, and only these dependency kinds:
 
 - `compute_order`
 - `ag_before_compute`
-- `materialize_before_compute`
-- `compute_before_materialize`
+- `consumer_wait_before_prefetch_issue`
+- `prefetch_issue_before_compute`
+- `compute_before_consumer_wait`
 - `compute_before_rs`
 
 The Chrome Trace artifact retains the sampled CUDA intervals for manual
-boundary inspection. It renders coarse compute elements, exposed
-materialization, direct GTP consumer compute, AG, and RS. It draws only
+boundary inspection. It renders coarse compute elements, consumer wait,
+prefetch-issue gaps, direct GTP consumer compute, AG, and RS. It draws only
 `ag_before_compute` and `compute_before_rs` flows to keep the view readable.
 
 Profiling cost is bounded by the configured sample count. Each observed compute,
-compute element, materialization, AG, or RS uses two timing events; the final
-consumer has no compute-element end and its provisional event is discarded.
-Raw CUDA kernels, CPU operators, and generic resource-conflict nodes are not
-collected. Completed samples are reduced to duration statistics, and all module
-hooks are removed after the artifact is written.
+compute element, opportunity interval, AG, or RS uses two timing events; the
+final consumer has no compute-element end and its provisional event is
+discarded. Raw CUDA kernels, CPU operators, and generic resource-conflict nodes
+are not collected. Completed samples are reduced to duration statistics, and
+all module hooks are removed after the artifact is written.
 
 The next step consumes this model to generate per-`GTPShardedParam` forward
 prefetch counts, backward prefetch counts, and RS issue/hold counts.

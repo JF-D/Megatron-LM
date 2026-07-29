@@ -190,7 +190,10 @@ class GTPRuntimeProfiler:
         self._counters: dict[tuple[str, GTPPhase, GTPWorkKind], int] = defaultdict(int)
         self._active_compute: dict[str, list[GTPProfileToken]] = defaultdict(list)
         self._active_compute_element: GTPProfileToken | None = None
-        self._pending_materialize: dict[
+        self._pending_consumer_wait: dict[
+            tuple[str, GTPPhase], list[GTPProfileToken]
+        ] = defaultdict(list)
+        self._pending_prefetch_issue_gap: dict[
             tuple[str, GTPPhase], list[GTPProfileToken]
         ] = defaultdict(list)
         self._current_orders: dict[GTPPhase, list[GTPProfileKey]] = defaultdict(list)
@@ -311,16 +314,17 @@ class GTPRuntimeProfiler:
                         del unused_module, unused_grad_output
                         stream = _current_cuda_stream()
                         for scope in scopes:
-                            materialize = self.consumer_ready(
+                            consumer_wait = self.consumer_enter(
                                 scope,
                                 GTPPhase.BACKWARD,
                                 stream,
                             )
+                            issue_gap = self.weight_ready(consumer_wait, stream)
                             self.compute_start(
                                 scope,
                                 GTPPhase.BACKWARD,
                                 stream,
-                                materialize_token=materialize,
+                                issue_gap_token=issue_gap,
                             )
 
                     self._hook_handles.append(
@@ -339,7 +343,8 @@ class GTPRuntimeProfiler:
         self._counters = defaultdict(int)
         self._active_compute = defaultdict(list)
         self._active_compute_element = None
-        self._pending_materialize = defaultdict(list)
+        self._pending_consumer_wait = defaultdict(list)
+        self._pending_prefetch_issue_gap = defaultdict(list)
         self._current_orders = defaultdict(list)
         self._current_compute_element_targets = {}
         self._recording = (
@@ -355,18 +360,24 @@ class GTPRuntimeProfiler:
 
         if self._active_iteration is None:
             return
-        unfinished_materialize = [
+        unfinished_consumer_wait = [
             token.key.stable_key
-            for tokens in self._pending_materialize.values()
+            for tokens in self._pending_consumer_wait.values()
             for token in tokens
         ]
-        if self._active_compute or unfinished_materialize:
+        unfinished_issue_gap = [
+            token.key.stable_key
+            for tokens in self._pending_prefetch_issue_gap.values()
+            for token in tokens
+        ]
+        if self._active_compute or unfinished_consumer_wait or unfinished_issue_gap:
             unfinished = sorted(
                 token.key.stable_key
                 for tokens in self._active_compute.values()
                 for token in tokens
             )
-            unfinished.extend(sorted(unfinished_materialize))
+            unfinished.extend(sorted(unfinished_consumer_wait))
+            unfinished.extend(sorted(unfinished_issue_gap))
             self._errors.append(
                 f"iteration {self._active_iteration} has unfinished compute operations: "
                 f"{unfinished[:8]}"
@@ -448,15 +459,15 @@ class GTPRuntimeProfiler:
 
         return self._new_token(scope, phase, GTPWorkKind.AG)
 
-    def consumer_ready(
+    def consumer_enter(
         self,
         scope: str,
         phase: GTPPhase,
         stream: object | None = None,
     ) -> GTPProfileToken | None:
-        """Mark a GTP consumer before it waits for its current weight."""
+        """Start the exposed wait for one consumer's current weight."""
 
-        token = self._new_token(scope, phase, GTPWorkKind.MATERIALIZE)
+        token = self._new_token(scope, phase, GTPWorkKind.CONSUMER_WAIT)
         if token is None:
             return None
         if self._active_compute_element is not None:
@@ -465,10 +476,44 @@ class GTPRuntimeProfiler:
             if self._recording:
                 self.recorder.record(element.key, _CudaMarker.END, stream)
         self._active_compute_element = None
-        self._pending_materialize[(scope, phase)].append(token)
+        self._pending_consumer_wait[(scope, phase)].append(token)
         if self._recording:
             self.recorder.record(token.key, _CudaMarker.START, stream)
         return token
+
+    def weight_ready(
+        self,
+        consumer_wait_token: GTPProfileToken | None,
+        stream: object | None = None,
+    ) -> GTPProfileToken | None:
+        """Close current-weight wait and start the future-prefetch issue gap."""
+
+        if consumer_wait_token is None:
+            return None
+        self._remove_pending_consumer_wait(consumer_wait_token)
+        if self._recording:
+            self.recorder.record(
+                consumer_wait_token.key,
+                _CudaMarker.END,
+                stream,
+            )
+        issue_gap = self._new_token(
+            consumer_wait_token.key.scope,
+            consumer_wait_token.key.phase,
+            GTPWorkKind.PREFETCH_ISSUE_GAP,
+        )
+        if issue_gap is None:
+            return None
+        if issue_gap.key.occurrence != consumer_wait_token.key.occurrence:
+            raise RuntimeError(
+                "GTP consumer-wait and prefetch-issue occurrences diverged for "
+                f"{consumer_wait_token.key.scope}"
+            )
+        key = (issue_gap.key.scope, issue_gap.key.phase)
+        self._pending_prefetch_issue_gap[key].append(issue_gap)
+        if self._recording:
+            self.recorder.record(issue_gap.key, _CudaMarker.START, stream)
+        return issue_gap
 
     def communication_start(
         self, token: GTPProfileToken | None, stream: object | None = None
@@ -492,23 +537,29 @@ class GTPRuntimeProfiler:
         phase: GTPPhase,
         stream: object | None = None,
         *,
-        materialize_token: GTPProfileToken | None = None,
+        issue_gap_token: GTPProfileToken | None = None,
     ) -> GTPProfileToken | None:
-        """Record dependent module compute start after its AG is available."""
+        """Close prefetch issue and start dependent module compute."""
 
         if self._active_iteration is None:
             return None
-        if materialize_token is None:
-            pending = self._pending_materialize.get((scope, phase))
-            materialize_token = pending[0] if pending else None
-        if materialize_token is None:
-            materialize_token = self.consumer_ready(scope, phase, stream)
-        if materialize_token is None:
+        if issue_gap_token is None:
+            pending = self._pending_prefetch_issue_gap.get((scope, phase))
+            issue_gap_token = pending[0] if pending else None
+        if issue_gap_token is None:
+            pending_wait = self._pending_consumer_wait.get((scope, phase))
+            consumer_wait_token = (
+                pending_wait[0]
+                if pending_wait
+                else self.consumer_enter(scope, phase, stream)
+            )
+            issue_gap_token = self.weight_ready(consumer_wait_token, stream)
+        if issue_gap_token is None:
             return None
-        self._remove_pending_materialize(materialize_token)
+        self._remove_pending_prefetch_issue_gap(issue_gap_token)
         if self._recording:
             self.recorder.record(
-                materialize_token.key,
+                issue_gap_token.key,
                 _CudaMarker.END,
                 stream,
             )
@@ -607,16 +658,27 @@ class GTPRuntimeProfiler:
             )
         )
 
-    def _remove_pending_materialize(self, token: GTPProfileToken) -> None:
+    def _remove_pending_consumer_wait(self, token: GTPProfileToken) -> None:
         key = (token.key.scope, token.key.phase)
-        tokens = self._pending_materialize.get(key)
+        tokens = self._pending_consumer_wait.get(key)
         if not tokens or token not in tokens:
             raise RuntimeError(
-                f"Unknown GTP materialize token {token.key.stable_key}"
+                f"Unknown GTP consumer-wait token {token.key.stable_key}"
             )
         tokens.remove(token)
         if not tokens:
-            del self._pending_materialize[key]
+            del self._pending_consumer_wait[key]
+
+    def _remove_pending_prefetch_issue_gap(self, token: GTPProfileToken) -> None:
+        key = (token.key.scope, token.key.phase)
+        tokens = self._pending_prefetch_issue_gap.get(key)
+        if not tokens or token not in tokens:
+            raise RuntimeError(
+                f"Unknown GTP prefetch-issue token {token.key.stable_key}"
+            )
+        tokens.remove(token)
+        if not tokens:
+            del self._pending_prefetch_issue_gap[key]
 
     def _pop_active_compute(
         self,
@@ -682,6 +744,11 @@ class GTPRuntimeProfiler:
                 self._reference_compute_element_targets or {}
             ),
             "timing_source": "cuda_events",
+            "communication_timing": "work_completion_fenced_on_comm_stream",
+            "opportunity_intervals": [
+                GTPWorkKind.CONSUMER_WAIT.value,
+                GTPWorkKind.PREFETCH_ISSUE_GAP.value,
+            ],
         }
         rank = _distributed_rank()
         path = self.config.log_dir / f"rank{rank:05d}_gtp_execution_model.json"

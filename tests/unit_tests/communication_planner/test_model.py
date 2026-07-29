@@ -116,7 +116,7 @@ def test_trace_separates_gtp_and_egtp_communication_lanes():
     )
 
     payload = model.to_dict()
-    assert payload["format_version"] == 3
+    assert payload["format_version"] == 4
     assert {
         operation["communication_domain"] for operation in payload["operations"]
     } == {"gtp", "egtp"}
@@ -158,10 +158,15 @@ def test_compute_element_spans_consecutive_gtp_consumers_and_modules():
         GTPPhase.FORWARD,
         GTPWorkKind.COMPUTE_ELEMENT,
     )
-    target_materialize = _key(
+    target_consumer_wait = _key(
         "mamba.out_proj",
         GTPPhase.FORWARD,
-        GTPWorkKind.MATERIALIZE,
+        GTPWorkKind.CONSUMER_WAIT,
+    )
+    target_issue_gap = _key(
+        "mamba.out_proj",
+        GTPPhase.FORWARD,
+        GTPWorkKind.PREFETCH_ISSUE_GAP,
     )
     modules = {
         "mamba.in_proj": GTPModuleInfo("decoder.layers.0", "M", 1),
@@ -171,19 +176,20 @@ def test_compute_element_spans_consecutive_gtp_consumers_and_modules():
         _sample(source_compute, 0, 100.0),
         _sample(target_compute, 0, 100.0),
         GTPCudaSample(element, 0, 10.0, 910.0),
-        GTPCudaSample(target_materialize, 0, 910.0, 960.0),
+        GTPCudaSample(target_consumer_wait, 0, 910.0, 920.0),
+        GTPCudaSample(target_issue_gap, 0, 920.0, 960.0),
     )
     model = GTPExecutionModel(
         phase_orders={GTPPhase.FORWARD: (source_compute, target_compute)},
         samples=samples,
         parameter_modules=modules,
-        compute_element_targets={element: target_materialize},
+        compute_element_targets={element: target_consumer_wait},
     )
 
     assert (
         element,
-        target_materialize,
-        "compute_before_materialize",
+        target_consumer_wait,
+        "compute_before_consumer_wait",
     ) in {
         (edge.src, edge.dst, edge.kind) for edge in model.dependencies
     }
@@ -212,10 +218,17 @@ def test_compute_element_spans_consecutive_gtp_consumers_and_modules():
     assert span["args"]["cuda_duration_us"] == 900.0
     assert span["args"]["module"]["symbol"] == "M"
     assert span["args"]["next_consumer"]["scope"] == "mamba.out_proj"
-    materialize_span = next(
+    consumer_wait_span = next(
         event
         for event in trace["traceEvents"]
         if event.get("ph") == "X"
-        and event["args"]["kind"] == "materialize"
+        and event["args"]["kind"] == "consumer_wait"
     )
-    assert span["tid"] == materialize_span["tid"]
+    issue_gap_span = next(
+        event
+        for event in trace["traceEvents"]
+        if event.get("ph") == "X"
+        and event["args"]["kind"] == "prefetch_issue_gap"
+    )
+    assert consumer_wait_span["tid"] == issue_gap_span["tid"]
+    assert span["tid"] != consumer_wait_span["tid"]
