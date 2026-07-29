@@ -58,6 +58,7 @@ class _FakeModule:
     def __init__(self, parameters):
         self._parameters = parameters
         self.handles = []
+        self.backward_pre_handles = []
 
     def named_parameters(self):
         return ((parameter._debug_name, parameter) for parameter in self._parameters)
@@ -72,6 +73,11 @@ class _FakeModule:
     def register_forward_hook(self, hook):
         handle = _FakeHandle()
         self.handles.append((hook, handle))
+        return handle
+
+    def register_full_backward_pre_hook(self, hook):
+        handle = _FakeHandle()
+        self.backward_pre_handles.append((hook, handle))
         return handle
 
 
@@ -178,4 +184,42 @@ def test_forward_end_does_not_close_backward_compute(tmp_path):
     assert rs is not None
     assert rs.key.occurrence == 0
     profiler.end_iteration(_FakeStream(4.0))
+    assert not profiler.errors
+
+
+def test_embedding_hooks_capture_direct_gradient_backward_compute(tmp_path):
+    module = _FakeModule([_FakeParameter("embedding.weight")])
+    module._gtp_runtime_profile_embedding = True
+    profiler = GTPRuntimeProfiler(
+        GTPRuntimeProfileConfig(warmup_iters=0, profile_iters=1, log_dir=tmp_path),
+        _recorder(),
+    )
+    assert profiler.attach_model(module) == 1
+    assert len(module.handles) == 1
+    assert len(module.backward_pre_handles) == 1
+
+    profiler.begin_iteration(3, _FakeStream(0.0))
+    profiler.compute_start("embedding.weight", GTPPhase.FORWARD, _FakeStream(1.0))
+    original_current_stream = runtime_module._current_cuda_stream
+    try:
+        runtime_module._current_cuda_stream = lambda: _FakeStream(3.0)
+        module.handles[0][0](module, (), None)
+        runtime_module._current_cuda_stream = lambda: _FakeStream(5.0)
+        module.backward_pre_handles[0][0](module, ())
+    finally:
+        runtime_module._current_cuda_stream = original_current_stream
+
+    rs = profiler.rs_ready("embedding.weight", _FakeStream(8.0))
+    profiler.communication_start(rs, _FakeStream(8.1))
+    profiler.communication_end(rs, _FakeStream(9.1))
+    profiler.end_iteration(_FakeStream(10.0))
+    model = profiler.build_model()
+
+    compute = {
+        key.phase: statistics.p50_us
+        for key, statistics in model.statistics.items()
+        if key.scope == "embedding.weight" and key.kind is GTPWorkKind.COMPUTE
+    }
+    assert math.isclose(compute[GTPPhase.FORWARD], 2000.0)
+    assert math.isclose(compute[GTPPhase.BACKWARD], 3000.0)
     assert not profiler.errors

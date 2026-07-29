@@ -214,7 +214,7 @@ class GTPRuntimeProfiler:
         return tuple(self._errors)
 
     def attach_model(self, model: object) -> int:
-        """Attach forward-end hooks to modules that directly own GTP parameters."""
+        """Attach compute-boundary hooks to modules that directly own GTP parameters."""
 
         chunks = list(model) if isinstance(model, (list, tuple)) else [model]
         attached_modules = set()
@@ -257,6 +257,17 @@ class GTPRuntimeProfiler:
                         self.forward_compute_end(scope, stream)
 
                 self._hook_handles.append(module.register_forward_hook(forward_end_hook))
+                if getattr(module, "_gtp_runtime_profile_embedding", False):
+
+                    def backward_start_hook(unused_module, unused_grad_output, *, scopes=scopes):
+                        del unused_module, unused_grad_output
+                        stream = _current_cuda_stream()
+                        for scope in scopes:
+                            self.compute_start(scope, GTPPhase.BACKWARD, stream)
+
+                    self._hook_handles.append(
+                        module.register_full_backward_pre_hook(backward_start_hook)
+                    )
         return len(attached_modules)
 
     def begin_iteration(self, iteration: int, stream: object | None = None) -> None:

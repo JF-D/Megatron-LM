@@ -2309,7 +2309,15 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def forward(ctx, weight):
         """All-gather the full embedding weight across the GTP group for the lookup."""
         ctx.save_for_backward(weight)
-        return weight.all_gather_and_prefetch(fwd=True)
+        result = weight.all_gather_and_prefetch(fwd=True)
+        runtime_profiler = get_gtp_runtime_profiler()
+        if runtime_profiler is not None and runtime_profiler.active:
+            runtime_profiler.compute_start(
+                weight._debug_name,
+                _runtime_profile_phase(True),
+                torch.cuda.current_stream(),
+            )
+        return result
 
     @staticmethod
     def backward(ctx, grad_output):

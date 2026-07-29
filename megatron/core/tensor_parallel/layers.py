@@ -322,6 +322,8 @@ class VocabParallelEmbedding(torch.nn.Module):
 
             wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
             self.gtp_remat_size = gtp_remat_group.size()
+            # This path bypasses TE's generic backward materialization callback.
+            self._gtp_runtime_profile_embedding = True
             # Nothing prefetches embedding — it is head of the UNGRAPHED
             # chain in fwd, and its bwd bypasses all_gather_and_prefetch_bwd
             # via GTPEmbeddingWeight.backward.
