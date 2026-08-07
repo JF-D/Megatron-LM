@@ -37,9 +37,11 @@ import torch
 from packaging.version import Version
 
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
+    allocate_graph_rs_fp32_accum_rings,
     allocate_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
+    register_capture_rs_fp32_accum_ring_slot,
     register_capture_wgrad_ring_slot,
 )
 from megatron.core.utils import log_single_rank
@@ -282,8 +284,8 @@ _AG_STREAMS: Dict[str, torch.cuda.Stream] = {}
 _RS_STREAMS: Dict[str, torch.cuda.Stream] = {}
 
 
-# Wgrad input buffer pool, keyed by (shape, dtype). UNGRAPHED-only: GRAPHED
-# wgrad bufs need address stability for CG replay and are not pool-recycled.
+# Eager backward scratch pool, keyed by (shape, dtype). GRAPHED buffers requiring address
+# stability use persistent ring storage and are not recycled through this pool.
 _wgrad_buf_pool: Dict[tuple, list] = {}
 
 # Double-buffering for the grouped one-block-ahead chains (docs §3.4):
@@ -366,11 +368,19 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
 
 
 def initialize_graph_wgrad_rings() -> None:
-    """Allocate persistent wgrad inputs before local CUDA-graph capture."""
+    """Allocate persistent backward workspaces before local CUDA-graph capture."""
     allocate_graph_wgrad_rings(
         _GTP_PARAMS,
         full_iteration=_FULL_ITERATION,
         async_reduction=GTP_CONFIG.async_reduction,
+        ring_size=GTP_CONFIG.graph_wgrad_ring_size,
+        graphed_chain_id=GTPChain.GRAPHED.value,
+        stream_key=_stream_key,
+    )
+    allocate_graph_rs_fp32_accum_rings(
+        _GTP_PARAMS,
+        full_iteration=_FULL_ITERATION,
+        fp32_accumulation=GTP_CONFIG.reduce_scatter_with_fp32_accumulation,
         ring_size=GTP_CONFIG.graph_wgrad_ring_size,
         graphed_chain_id=GTPChain.GRAPHED.value,
         stream_key=_stream_key,
@@ -424,9 +434,9 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
-    # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
-    # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
-    # same-key writers may need more slots to keep all in-flight RS inputs distinct.
+    # Persistent backward slots per scheduling/shape domain for partial-CG reduce-scatter. These
+    # protect wgrad inputs and optional FP32-accumulation workspaces. Two slots cover the usual case
+    # of one same-key writer per graph; a graph with several may need more.
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
 
@@ -893,6 +903,7 @@ def _init_gtp_runtime_attrs(obj):
     obj.rs_event = torch.cuda.Event(external=True)
     obj._rs_ticket = None
     obj._rs_a2a_bufs = None  # all-to-all scratch held by an in-flight fp32-accum RS
+    obj._gtp_graph_rs_fp32_accum_ring_slot = None
     # Padding
     obj.pad_length = 0
     # Debug
@@ -1681,15 +1692,15 @@ class GTPShardedParam(torch.nn.Parameter):
         if gtp_remat_size > 1 and not GTP_CONFIG.calculate_per_token_loss:
             torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
 
-    def _reduce_scatter_fp32_accum(self, tensor, out_buffer):
+    def _reduce_scatter_fp32_accum(self, tensor, out_buffer, weight):
         """Issue one fp32-accum reduce-scatter (all-to-all now, FP32 sum at wait) -> (out, handle).
 
         Always issued async, even for a sync RS: under a coalescing manager the all-to-all is
         only enqueued at context exit, so the handle's FP32 sum must never run inline here. The
         caller waits the handle (immediately when sync) and then releases the scratch.
 
-        The all-to-all scratch is unsharded-sized, so it comes from the wgrad pool: GTP keeps
-        several RS in flight and an empty_like each would add that much peak memory.
+        Eager execution reuses the wgrad pool. Partial CUDA graphs use persistent ring storage
+        because independently replayed graphs may overlap while sharing one graph memory pool.
         """
         # Local import: tensor_parallel has no top-level dependency on core.distributed.
         from megatron.core.distributed.reduce_scatter_with_fp32_accumulation import (
@@ -1701,7 +1712,15 @@ class GTPShardedParam(torch.nn.Parameter):
             out_shape = [tensor.shape[0] // self.group.size(), *tensor.shape[1:]]
             out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
 
-        a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
+        workspace_slot = getattr(weight, "_gtp_graph_rs_fp32_accum_ring_slot", None)
+        if workspace_slot is None:
+            a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
+            fp32_accum_buf = None
+        else:
+            register_capture_rs_fp32_accum_ring_slot(workspace_slot, weight)
+            a2a_buf = workspace_slot.a2a_output
+            fp32_accum_buf = workspace_slot.fp32_accum_output
+
         handle = reduce_scatter_with_fp32_accumulation(
             out_buffer,
             tensor,
@@ -1709,10 +1728,12 @@ class GTPShardedParam(torch.nn.Parameter):
             group=self.group,
             async_op=True,
             all_to_all_output_tensor=a2a_buf,
+            fp32_accumulation_output_tensor=fp32_accum_buf,
         )
-        # Input to the deferred FP32 sum: held until the handle is waited on, then released by
-        # _release_comm_scratch (from _wait_reduce_scatter, or inline on the sync path).
-        self._rs_a2a_bufs = (self._rs_a2a_bufs or []) + [a2a_buf]
+        if workspace_slot is None:
+            # Input to the deferred FP32 sum: held until the handle is waited on, then released
+            # by _release_comm_scratch (from _wait_reduce_scatter, or inline on the sync path).
+            self._rs_a2a_bufs = (self._rs_a2a_bufs or []) + [a2a_buf]
         return out_buffer, handle
 
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
@@ -1774,8 +1795,8 @@ class GTPShardedParam(torch.nn.Parameter):
                     with torch.distributed._coalescing_manager(
                         group=self.group, device=wgrads[0].device, async_ops=True
                     ) as cm:
-                        for out_buffer, tensor in zip(out_buffers, wgrads):
-                            out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer)
+                        for weight, out_buffer, tensor in zip(self._weights, out_buffers, wgrads):
+                            out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer, weight)
                             outputs.append(out)
                             sum_handles.append(h)
                     # The grouped work from _end_coalescing is the real completion; the per-op
@@ -1784,7 +1805,9 @@ class GTPShardedParam(torch.nn.Parameter):
                         h.all_to_all_handle = None
                     handle = _GTPCompositeWorkHandle([cm, *sum_handles])
                 else:
-                    out, handle = self._reduce_scatter_fp32_accum(wgrads[0], out_buffers[0])
+                    out, handle = self._reduce_scatter_fp32_accum(
+                        wgrads[0], out_buffers[0], self._weights[0]
+                    )
                     outputs.append(out)
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs_fp32accum")
                 if async_op:

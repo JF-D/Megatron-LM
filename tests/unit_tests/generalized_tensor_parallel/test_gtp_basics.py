@@ -24,7 +24,7 @@ Test groups
 - TestGTPDDPBucketAlignment  - GTP/regular DDP bucket ends padded for dist-opt alignment
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
-- TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and RS-input correctness
+- TestGTPGraphWgradRing       - partial-CG wgrad and FP32-RS workspace ownership
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
@@ -1337,9 +1337,11 @@ class TestGTPDDPGradReadyWiring:
 
 class TestGTPGraphWgradRing:
     @staticmethod
-    def _make_padded_chain(count=4):
-        group = _FakeGroup(size=2)
-        weights = [GTPShardedParam(torch.randn(3, 4, device="cuda")) for _ in range(count)]
+    def _make_padded_chain(count=4, group_size=2, dtype=torch.float32):
+        group = _FakeGroup(size=group_size)
+        weights = [
+            GTPShardedParam(torch.randn(3, 4, device="cuda", dtype=dtype)) for _ in range(count)
+        ]
         for weight in weights:
             weight.group = group
             weight.chain_id = GTPChain.GRAPHED.value
@@ -1385,6 +1387,65 @@ class TestGTPGraphWgradRing:
 
         with pytest.raises(RuntimeError, match="increase GTP_CONFIG.graph_wgrad_ring_size"):
             weights[3]._prepare_wgrad_reduce_scatter_inputs([logical_view])
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_partial_cg_fp32_rs_workspace_ring_ownership(self, monkeypatch):
+        import megatron.core.distributed.reduce_scatter_with_fp32_accumulation as rs_fp32_module
+
+        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
+        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_RS_FP32_ACCUM_RINGS", {})
+
+        weights = self._make_padded_chain(group_size=4, dtype=torch.bfloat16)
+        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", weights)
+        gtp_module.initialize_graph_wgrad_rings()
+
+        first_slot = weights[0]._gtp_graph_rs_fp32_accum_ring_slot
+        second_slot = weights[1]._gtp_graph_rs_fp32_accum_ring_slot
+        assert first_slot is weights[2]._gtp_graph_rs_fp32_accum_ring_slot
+        assert second_slot is weights[3]._gtp_graph_rs_fp32_accum_ring_slot
+        assert first_slot is not second_slot
+        assert first_slot.a2a_output.shape == (12, 4)
+        assert first_slot.a2a_output.dtype == torch.bfloat16
+        assert first_slot.fp32_accum_output.shape == (3, 4)
+        assert first_slot.fp32_accum_output.dtype == torch.float32
+        assert first_slot.ready_event.query()
+
+        captured = {}
+        fake_handle = object()
+
+        def fake_reduce_scatter(output_tensor, input_tensor, **kwargs):
+            del output_tensor, input_tensor
+            captured.update(kwargs)
+            return fake_handle
+
+        monkeypatch.setattr(
+            rs_fp32_module, "reduce_scatter_with_fp32_accumulation", fake_reduce_scatter
+        )
+
+        def fail_eager_pool(*_args, **_kwargs):
+            raise AssertionError("partial CG must not use the eager wgrad pool")
+
+        monkeypatch.setattr(gtp_module, "_wgrad_pool_get", fail_eager_pool)
+        rs_input = torch.ones((12, 4), device="cuda", dtype=torch.bfloat16)
+        rs_output = torch.empty((3, 4), device="cuda", dtype=torch.bfloat16)
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture_state:
+            output, handle = weights[0]._reduce_scatter_fp32_accum(rs_input, rs_output, weights[0])
+
+        assert output is rs_output
+        assert handle is fake_handle
+        assert captured["all_to_all_output_tensor"] is first_slot.a2a_output
+        assert captured["fp32_accumulation_output_tensor"] is first_slot.fp32_accum_output
+        assert capture_state.rs_fp32_accum_ring_slots == [first_slot]
+        assert weights[0]._rs_a2a_bufs is None
+
+        capture_state = gtp_cuda_graphs.GTPCaptureCommState()
+        capture_state.register_rs_fp32_accum_ring_slot(first_slot, weights[0])
+        with pytest.raises(RuntimeError, match="increase GTP_CONFIG.graph_wgrad_ring_size"):
+            capture_state.register_rs_fp32_accum_ring_slot(first_slot, weights[2])
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
     def test_native_fp8_style_param_uses_wgrad_ring(self, monkeypatch):

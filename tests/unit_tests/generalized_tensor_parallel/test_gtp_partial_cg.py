@@ -3,9 +3,9 @@
 """Integration test for GTP correctness with local partial CUDA graphs.
 
 This is the local-CUDA-graph counterpart of ``test_gtp_loss_correctness.py``. It compares eager
-execution with attention-only local CUDA graphs under the same GTP2 x DP2 topology, with and
-without cross-graph RS overlap. It verifies the complete loss trajectory and global gradient norm,
-including repeated replays of one backward.
+execution with attention-only local CUDA graphs under the same topology. It covers GTP2 x DP2 and
+GTP4 x DP1 with FP32-accumulation reduce-scatter, verifies the complete loss trajectory and global
+gradient norm, and repeatedly replays one backward.
 """
 
 import copy
@@ -27,6 +27,7 @@ if not HAVE_GTP:
 from transformer_engine.pytorch import fp8_autocast
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
+import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
     _run_distributed,
@@ -36,9 +37,16 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 )
 
 
-def _worker_gtp_partial_cg_correctness(rank, world_size, port):
-    """Compare eager and local attention CUDA graphs with GTP2 x DP2."""
+def _worker_gtp_partial_cg_correctness(
+    rank, world_size, port, gtp_degree=2, fp32_accumulation=False
+):
+    """Compare eager and local attention CUDA graphs with the requested GTP topology."""
     del port
+
+    gtp_module._GTP_PARAMS.clear()
+    gtp_cuda_graphs._GRAPH_WGRAD_RINGS.clear()
+    gtp_cuda_graphs._GRAPH_RS_FP32_ACCUM_RINGS.clear()
+    gtp_module.update_gtp_config(reduce_scatter_with_fp32_accumulation=fp32_accumulation)
 
     from megatron.core import parallel_state as ps
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -68,8 +76,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
     learning_rate = 0.01
     steps = 10
     dtype = torch.bfloat16
-    gtp_degree = 2
-    dp_degree = 2
+    assert world_size % gtp_degree == 0
+    dp_degree = world_size // gtp_degree
     assert world_size == gtp_degree * dp_degree
 
     def make_config(*, partial_cg=False):
@@ -247,6 +255,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
         runners = [layer.cudagraph_manager.cudagraph_runners[0] for layer in partial_cg]
         assert all(runner.gtp_remat for runner in runners)
         assert any(runner._gtp_wgrad_ring_slots for runner in runners)
+        if fp32_accumulation:
+            assert any(runner._gtp_rs_fp32_accum_ring_slots for runner in runners)
 
         replay_grad_norms = []
         replay_losses = []
@@ -308,6 +318,10 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
         gtp_module.reset_gtp_state()
+        gtp_module.update_gtp_config(reduce_scatter_with_fp32_accumulation=False)
+        gtp_cuda_graphs._GRAPH_WGRAD_RINGS.clear()
+        gtp_cuda_graphs._GRAPH_RS_FP32_ACCUM_RINGS.clear()
+        gtp_module._GTP_PARAMS.clear()
 
     if rank == 0:
         for step, (eager_loss, partial_cg_loss) in enumerate(zip(eager_losses, partial_cg_losses)):
@@ -329,3 +343,9 @@ class TestGTPPartialCGCorrectness:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_gtp_partial_cg_correctness, 4)
+
+    def test_gtp_fp32_accumulation_partial_cg_matches_eager(self):
+        """GTP4 FP32-accumulation RS workspaces must remain stable across graph replays."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires at least 4 CUDA devices")
+        _run_distributed(_worker_gtp_partial_cg_correctness, 4, 4, True)

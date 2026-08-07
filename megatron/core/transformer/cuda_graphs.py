@@ -850,12 +850,12 @@ class _CudagraphReplayNode(torch.autograd.Function):
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             if runner.gtp_remat:
-                for slot in runner._gtp_wgrad_ring_slots:
+                for slot in runner._gtp_replay_ring_slots:
                     runner.stream.wait_event(slot.ready_event)
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
                 if runner.gtp_remat:
-                    for slot in runner._gtp_wgrad_ring_slots:
+                    for slot in runner._gtp_replay_ring_slots:
                         slot.ready_event.record(runner.stream)
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
         else:
@@ -946,6 +946,10 @@ class _CudaGraphRunner(torch.nn.Module):
         # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
         # reader before launching the graph.
         self._gtp_wgrad_ring_slots = []
+        # Persistent FP32-accumulation RS workspaces used by this graph.
+        self._gtp_rs_fp32_accum_ring_slots = []
+        # Combined replay fence list for all bounded GTP backward storage.
+        self._gtp_replay_ring_slots = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -1505,6 +1509,13 @@ class _CudaGraphRunner(torch.nn.Module):
             self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
         )
         self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
+        self._gtp_rs_fp32_accum_ring_slots = (
+            list(capture_comms.rs_fp32_accum_ring_slots) if self.gtp_remat else []
+        )
+        self._gtp_replay_ring_slots = [
+            *self._gtp_wgrad_ring_slots,
+            *self._gtp_rs_fp32_accum_ring_slots,
+        ]
 
         # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's
         # replay-invariant — so Graphed.backward avoids per-replay group lookups.
