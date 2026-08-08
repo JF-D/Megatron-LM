@@ -23,14 +23,15 @@ try:
         get_rs_stream,
         gtp_native_fp8_load_context,
         gtp_remat_shard_dim0,
-        initialize_graph_wgrad_rings,
         is_gtp_param,
         make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        prepare_graph_cache_for_lanes,
         wait_async_comms,
         wait_for_gtp_grad_reduction_on_current_stream,
         wrap_module_params_gtp,
     )
     from megatron.core.tensor_parallel.gtp_cuda_graphs import (
+        GTPGraphPoolLane,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
     )
@@ -45,6 +46,7 @@ except ImportError:
 __all__ = [
     "HAVE_GTP",
     "GTP_CONFIG",
+    "GTPGraphPoolLane",
     "GTPChain",
     "GTPEmbeddingWeight",
     "attach_gtp_to_presharded_module",
@@ -56,8 +58,8 @@ __all__ = [
     "gtp_native_fp8_load_context",
     "gtp_remat_shard_dim0",
     "is_gtp_param",
-    "initialize_graph_wgrad_rings",
     "make_sharded_tensors_for_checkpoint_with_gtp_remat",
+    "prepare_graph_cache_for_lanes",
     "set_cuda_graph_mempool",
     "track_gtp_capture_comms",
     "wait_async_comms",

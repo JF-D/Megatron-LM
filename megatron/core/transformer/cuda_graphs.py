@@ -68,9 +68,10 @@ if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import (
         GTP_CONFIG,
         GTPChain,
+        GTPGraphPoolLane,
         get_ag_stream,
         get_rs_stream,
-        initialize_graph_wgrad_rings,
+        prepare_graph_cache_for_lanes,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
         wait_async_comms,
@@ -81,9 +82,10 @@ else:
     # gtp_remat at runtime.
     GTPChain = None
     GTP_CONFIG = None
+    GTPGraphPoolLane = None
     get_ag_stream = None
     get_rs_stream = None
-    initialize_graph_wgrad_rings = None
+    prepare_graph_cache_for_lanes = None
     set_cuda_graph_mempool = None
     track_gtp_capture_comms = None
     wait_async_comms = None
@@ -282,17 +284,15 @@ class ArgMetadata:
         )
 
 
-def alloc_tensor_from_graph_mempool(meta: ArgMetadata):
+def alloc_tensor_from_graph_mempool(meta: ArgMetadata, mempool):
     """Allocates a tensor specified by a ArgMetadata into the graph mempool."""
 
-    torch._C._cuda_beginAllocateCurrentThreadToPool(
-        torch.cuda.current_device(), CudaGraphManager.global_mempool
-    )
+    torch._C._cuda_beginAllocateCurrentThreadToPool(torch.cuda.current_device(), mempool)
     out = meta.zeros_like()
     out.is_from_global_mempool = True
     out.requires_grad_(meta.requires_grad)
 
-    torch._C._cuda_endAllocateToPool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
+    torch._C._cuda_endAllocateToPool(torch.cuda.current_device(), mempool)
     return out
 
 
@@ -594,7 +594,20 @@ class _CudagraphGlobalRecord:
         if gtp_active:
             # GTP buffer reuse during capture trips the param-state debug asserts; disable them.
             GTP_CONFIG.check_param_states = False
-            initialize_graph_wgrad_rings()
+            CudaGraphManager.initialize_gtp_mempool_lanes()
+            lanes = CudaGraphManager.gtp_mempool_lanes
+            gtp_backward_runners = [
+                record[0]
+                for record in cls.cudagraph_record
+                if record[1] == "bwd" and record[0].gtp_remat
+            ]
+            for graph_index, runner in enumerate(gtp_backward_runners):
+                lane = lanes[graph_index % len(lanes)]
+                assert runner.use_stream
+                runner.mempool = lane.mempool
+                runner.bwd_mempool = lane.mempool
+                runner.gtp_mempool_lane = lane
+            prepare_graph_cache_for_lanes(lanes)
 
         _set_capture_start()
         if has_te_modules:
@@ -622,12 +635,22 @@ class _CudagraphGlobalRecord:
                     logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
 
             runner, graph_type = g[0:2]
-            if graph_type == 'fwd':
-                args, kwargs, out = g[2:]
-                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
-            else:
-                assert fwd_buffer_reuse_ref_count == 0
-                runner.create_bwd_graph()
+            if runner.gtp_mempool_lane is not None:
+                set_cuda_graph_mempool(
+                    torch.cuda.current_device(), runner.mempool, lane=runner.gtp_mempool_lane
+                )
+            try:
+                if graph_type == 'fwd':
+                    args, kwargs, out = g[2:]
+                    runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
+                else:
+                    assert fwd_buffer_reuse_ref_count == 0
+                    runner.create_bwd_graph()
+            finally:
+                if runner.gtp_mempool_lane is not None:
+                    set_cuda_graph_mempool(
+                        torch.cuda.current_device(), CudaGraphManager.global_mempool
+                    )
 
         # Memory usage.
         time_end = time.time()
@@ -709,6 +732,8 @@ def delete_cuda_graphs():
         runner.fwd_graph = None
         runner.bwd_graph = None
         runner.mempool = None
+        runner.bwd_mempool = None
+        runner.gtp_mempool_lane = None
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -721,6 +746,7 @@ def delete_cuda_graphs():
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
+    CudaGraphManager.gtp_mempool_lanes = None
 
 
 class _GraphStatus(Enum):
@@ -840,24 +866,27 @@ class _CudagraphReplayNode(torch.autograd.Function):
             runner.static_grad_outputs
         ), "Bwd cudagraph received a different number of tensors than what it was graphed with!"
 
-        # Copy new data into bwd graph input buffer
+        current_stream = torch.cuda.current_stream()
+        lane = runner.gtp_mempool_lane
+        if lane is not None:
+            # This copy may consume a dgrad produced in the other lane. Wait only for the
+            # destination lane, preserving overlap with the preceding graph's Phase 2.
+            lane.wait_for_reuse(current_stream)
+
+        # Copy new data into bwd graph input buffer.
         for user_output_grad, cudagraph_output_grad in zip(grads, runner.static_grad_outputs):
             if cudagraph_output_grad is None:
                 continue
-            if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
+            if lane is not None or user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
         if runner.use_stream:
-            runner.stream.wait_stream(torch.cuda.current_stream())
-            if runner.gtp_remat:
-                for slot in runner._gtp_replay_ring_slots:
-                    runner.stream.wait_event(slot.ready_event)
+            runner.stream.wait_stream(current_stream)
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
-                if runner.gtp_remat:
-                    for slot in runner._gtp_replay_ring_slots:
-                        slot.ready_event.record(runner.stream)
-            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+                if lane is not None:
+                    lane.mark_reusable_after(runner.stream)
+            current_stream.wait_event(runner.bwd_completion_event)
         else:
             runner.bwd_graph.replay()
 
@@ -911,6 +940,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.base_module = base_module
         self.mempool = mempool
+        self.bwd_mempool = mempool
+        self.gtp_mempool_lane = None
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
         self.fwd_graph_input_kwarg_metas = {
@@ -943,13 +974,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
-        # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
-        # reader before launching the graph.
-        self._gtp_wgrad_ring_slots = []
-        # Persistent FP32-accumulation RS workspaces used by this graph.
-        self._gtp_rs_fp32_accum_ring_slots = []
-        # Combined replay fence list for all bounded GTP backward storage.
-        self._gtp_replay_ring_slots = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -1247,7 +1271,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 buf = create_strong_ref(shared_buf)
             else:
                 # need to provide a fresh buffer from the pool
-                buf = alloc_tensor_from_graph_mempool(ten)
+                buf = alloc_tensor_from_graph_mempool(ten, self.mempool)
                 if metadata is not None:
                     buf.cg_buffer_metadata = deepcopy(metadata)
                 can_skip_replay_copy = False
@@ -1265,7 +1289,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     and metadata.input_use_count > 1
                     and metadata.fwd_cudagraph_buffer is None
                 ):
-                    buf = alloc_tensor_from_graph_mempool(ten)
+                    buf = alloc_tensor_from_graph_mempool(ten, self.mempool)
                     buf.cg_buffer_metadata = deepcopy(metadata)
                     buf.cg_buffer_metadata.capture_reuse_count = metadata.input_use_count
                     metadata.fwd_cudagraph_buffer = buf
@@ -1440,12 +1464,16 @@ class _CudaGraphRunner(torch.nn.Module):
                 # cudagraph expects the buffer to be provided 'fwd_cudagraph_buffer' but is missing.
                 # So, we cannot always assume this metadata exists. Consequently, there are extra
                 # copies between the outputs of the fwd-bwd pass and the bwd pass.
-                if metadata.is_cudagraph_input and metadata.bwd_cudagraph_buffer is not None:
+                if (
+                    self.gtp_mempool_lane is None
+                    and metadata.is_cudagraph_input
+                    and metadata.bwd_cudagraph_buffer is not None
+                ):
                     out_grad = metadata.bwd_cudagraph_buffer
                     args_to_clear_buffers.append(o)
                     out_grad.cg_buffer_metadata.capture_reuse_count -= 1
                 else:
-                    out_grad = alloc_tensor_from_graph_mempool(o)
+                    out_grad = alloc_tensor_from_graph_mempool(o, self.bwd_mempool)
             self.static_grad_outputs.append(out_grad)
 
         # Freeze GC, to speed up capture time ~15-20x.
@@ -1455,7 +1483,7 @@ class _CudaGraphRunner(torch.nn.Module):
         capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
         with (
             capture_comm_context as capture_comms,
-            torch.cuda.graph(self.bwd_graph, pool=self.mempool),
+            torch.cuda.graph(self.bwd_graph, pool=self.bwd_mempool),
         ):
 
             grad_inputs = torch.autograd.grad(
@@ -1508,15 +1536,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = (
             self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
         )
-        self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
-        self._gtp_rs_fp32_accum_ring_slots = (
-            list(capture_comms.rs_fp32_accum_ring_slots) if self.gtp_remat else []
-        )
-        self._gtp_replay_ring_slots = [
-            *self._gtp_wgrad_ring_slots,
-            *self._gtp_rs_fp32_accum_ring_slots,
-        ]
-
         # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's
         # replay-invariant — so Graphed.backward avoids per-replay group lookups.
         self._gtp_finalize_hook_plan = []
@@ -1551,7 +1570,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 input_grad.is_from_global_mempool = True
                 input_grad.cg_buffer_metadata = deepcopy(metadata)
 
-                if metadata.is_cudagraph_output and metadata.bwd_cudagraph_buffer is None:
+                if (
+                    self.gtp_mempool_lane is None
+                    and metadata.is_cudagraph_output
+                    and metadata.bwd_cudagraph_buffer is None
+                ):
                     buf = create_strong_ref(input_grad)
                     metadata.bwd_cudagraph_buffer = buf
                     buf.cg_buffer_metadata.capture_reuse_count += 1
@@ -1564,8 +1587,8 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_inputs = tuple(self.static_grad_inputs)
         self.static_grad_outputs = tuple(self.static_grad_outputs)
 
-        # It is safe to weakref static_grad_inputs as any inuse input grads have a strong ref
-        # stored in 'bwd_cudagraph_buffer'
+        # A reused dgrad either has a strong bwd_cudagraph_buffer reference or belongs to a
+        # fenced graph-pool lane whose graph executable retains its captured address.
         self.static_grad_inputs = tree_map(make_weakref, self.static_grad_inputs)
         self.static_grad_outputs = tree_map(make_weakref, self.static_grad_outputs)
         # Backward capture is the final recorded use of forward buffers retained for autograd.
@@ -1790,6 +1813,18 @@ class CudaGraphManager(torch.nn.Module):
 
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
+    gtp_mempool_lanes = None
+
+    @classmethod
+    def initialize_gtp_mempool_lanes(cls) -> None:
+        """Create two bounded storage lanes for GTP local CUDA graphs."""
+        if cls.gtp_mempool_lanes is not None:
+            return
+        cls.gtp_mempool_lanes = [
+            GTPGraphPoolLane(index=index, mempool=torch.cuda.graph_pool_handle())
+            for index in range(2)
+        ]
+        log_single_rank(logger, logging.INFO, "GTP local CUDA graphs use 2 memory-pool lanes")
 
     def __init__(
         self,

@@ -27,7 +27,6 @@ if not HAVE_GTP:
 from transformer_engine.pytorch import fp8_autocast
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
-import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
     _run_distributed,
@@ -44,8 +43,6 @@ def _worker_gtp_partial_cg_correctness(
     del port
 
     gtp_module._GTP_PARAMS.clear()
-    gtp_cuda_graphs._GRAPH_WGRAD_RINGS.clear()
-    gtp_cuda_graphs._GRAPH_RS_FP32_ACCUM_RINGS.clear()
     gtp_module.update_gtp_config(reduce_scatter_with_fp32_accumulation=fp32_accumulation)
 
     from megatron.core import parallel_state as ps
@@ -58,6 +55,7 @@ def _worker_gtp_partial_cg_correctness(
         model_parallel_cuda_manual_seed,
     )
     from megatron.core.transformer.cuda_graphs import (
+        CudaGraphManager,
         _CudagraphGlobalRecord,
         create_cudagraphs,
         delete_cuda_graphs,
@@ -68,8 +66,7 @@ def _worker_gtp_partial_cg_correctness(
     hidden = 4096
     num_heads = 32
     ffn_hidden = 16384
-    # Four layers force parameters with matching scheduling domains/shapes to reuse the two-slot
-    # wgrad ring across independently replayed graphs.
+    # Four layers force both graph-memory lanes to be reused during backward replay.
     num_layers = 4
     sequence_length = 32
     batch_size = 1
@@ -254,9 +251,11 @@ def _worker_gtp_partial_cg_correctness(
         assert _CudagraphGlobalRecord.cudagraph_created
         runners = [layer.cudagraph_manager.cudagraph_runners[0] for layer in partial_cg]
         assert all(runner.gtp_remat for runner in runners)
-        assert any(runner._gtp_wgrad_ring_slots for runner in runners)
-        if fp32_accumulation:
-            assert any(runner._gtp_rs_fp32_accum_ring_slots for runner in runners)
+        lanes = CudaGraphManager.gtp_mempool_lanes
+        assert lanes is not None and len(lanes) == 2
+        assert {runner.gtp_mempool_lane.index for runner in runners} == {0, 1}
+        assert all(runner.bwd_mempool == runner.gtp_mempool_lane.mempool for runner in runners)
+        assert all(lane.rs_outputs for lane in lanes)
 
         replay_grad_norms = []
         replay_losses = []
@@ -319,8 +318,6 @@ def _worker_gtp_partial_cg_correctness(
         ps.initialize_model_parallel()
         gtp_module.reset_gtp_state()
         gtp_module.update_gtp_config(reduce_scatter_with_fp32_accumulation=False)
-        gtp_cuda_graphs._GRAPH_WGRAD_RINGS.clear()
-        gtp_cuda_graphs._GRAPH_RS_FP32_ACCUM_RINGS.clear()
         gtp_module._GTP_PARAMS.clear()
 
     if rank == 0:
@@ -345,7 +342,7 @@ class TestGTPPartialCGCorrectness:
         _run_distributed(_worker_gtp_partial_cg_correctness, 4)
 
     def test_gtp_fp32_accumulation_partial_cg_matches_eager(self):
-        """GTP4 FP32-accumulation RS workspaces must remain stable across graph replays."""
+        """GTP4 FP32-accumulation RS must remain correct across graph-pool lane reuse."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_gtp_partial_cg_correctness, 4, 4, True)

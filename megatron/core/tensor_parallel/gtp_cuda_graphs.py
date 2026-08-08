@@ -5,44 +5,38 @@
 This module owns state that exists only for local CUDA-graph capture and replay:
 
 * capture-local ownership of asynchronous GTP communication;
-* persistent wgrad and FP32-RS workspace rings whose lifetimes may cross graph boundaries;
-* routing graph-owned allocations into the shared CUDA-graph memory pool.
+* alternating graph-memory lanes for bounded cross-graph ownership;
+* routing graph-owned allocations into the active CUDA-graph memory pool.
 """
 
 from __future__ import annotations
 
-import logging
-from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional
+from typing import Optional
 
 import torch
 
-from megatron.core.utils import log_single_rank
-
-logger = logging.getLogger(__name__)
-
 
 @dataclass
-class GraphWgradRingSlot:
-    """One persistent wgrad slot guarded by its reduce-scatter completion event."""
+class GTPGraphPoolLane:
+    """One graph-memory lane reused only after its prior replay drains."""
 
-    tensor: torch.Tensor
-    ready_event: torch.cuda.Event
-    key: tuple
     index: int
+    mempool: object
+    ready_event: torch.cuda.Event = field(default_factory=torch.cuda.Event)
+    rs_outputs: dict = field(default_factory=dict)
+    has_pending_work: bool = False
 
+    def wait_for_reuse(self, stream: torch.cuda.Stream) -> None:
+        """Delay new writes until the previous graph and its side streams finish."""
+        if self.has_pending_work:
+            stream.wait_event(self.ready_event)
 
-@dataclass
-class GraphRSFP32AccumRingSlot:
-    """Persistent workspace for one graph-captured FP32-accumulation reduce-scatter."""
-
-    a2a_output: torch.Tensor
-    fp32_accum_output: torch.Tensor
-    ready_event: torch.cuda.Event
-    key: tuple
-    index: int
+    def mark_reusable_after(self, stream: torch.cuda.Stream) -> None:
+        """Publish lane availability at the tail of a graph replay."""
+        self.ready_event.record(stream)
+        self.has_pending_work = True
 
 
 @dataclass
@@ -52,13 +46,10 @@ class GTPCaptureCommState:
     params: list = field(default_factory=list)
     ag_streams: list = field(default_factory=list)
     rs_streams: list = field(default_factory=list)
-    wgrad_ring_slots: list = field(default_factory=list)
-    rs_fp32_accum_ring_slots: list = field(default_factory=list)
     _param_ids: set = field(default_factory=set)
     _ag_stream_ids: set = field(default_factory=set)
     _rs_stream_ids: set = field(default_factory=set)
-    _wgrad_ring_slot_params: dict = field(default_factory=dict)
-    _rs_fp32_accum_ring_slot_params: dict = field(default_factory=dict)
+    _rs_cache_buffer_params: dict = field(default_factory=dict)
 
     def register_comm(self, param, stream: torch.cuda.Stream, *, reduce_scatter: bool) -> None:
         """Record a parameter and side stream owned by this graph capture."""
@@ -74,33 +65,16 @@ class GTPCaptureCommState:
             stream_ids.add(stream_id)
             streams.append(stream)
 
-    def register_wgrad_ring_slot(self, slot: GraphWgradRingSlot, param) -> None:
-        """Track slots used by this graph and reject unsafe intra-graph aliasing."""
-        slot_id = id(slot)
+    def register_rs_cache_buffer(self, buffer: torch.Tensor, param) -> None:
+        """Reject two parameters using one lane-local RS output in the same graph."""
+        buffer_id = id(buffer)
         param_id = id(param)
-        prior_param_id = self._wgrad_ring_slot_params.get(slot_id)
+        prior_param_id = self._rs_cache_buffer_params.get(buffer_id)
         if prior_param_id is not None and prior_param_id != param_id:
             raise RuntimeError(
-                "One CUDA graph writes the same GTP wgrad ring slot for multiple "
-                "parameters; increase GTP_CONFIG.graph_wgrad_ring_size"
+                "One CUDA graph uses the same GTP lane-local RS output for multiple parameters"
             )
-        if prior_param_id is None:
-            self._wgrad_ring_slot_params[slot_id] = param_id
-            self.wgrad_ring_slots.append(slot)
-
-    def register_rs_fp32_accum_ring_slot(self, slot: GraphRSFP32AccumRingSlot, param) -> None:
-        """Track FP32-RS workspaces and reject unsafe intra-graph aliasing."""
-        slot_id = id(slot)
-        param_id = id(param)
-        prior_param_id = self._rs_fp32_accum_ring_slot_params.get(slot_id)
-        if prior_param_id is not None and prior_param_id != param_id:
-            raise RuntimeError(
-                "One CUDA graph uses the same GTP FP32-RS workspace for multiple parameters; "
-                "increase GTP_CONFIG.graph_wgrad_ring_size"
-            )
-        if prior_param_id is None:
-            self._rs_fp32_accum_ring_slot_params[slot_id] = param_id
-            self.rs_fp32_accum_ring_slots.append(slot)
+        self._rs_cache_buffer_params[buffer_id] = param_id
 
 
 _ACTIVE_CAPTURE_COMM_STATE: Optional[GTPCaptureCommState] = None
@@ -112,16 +86,10 @@ def register_capture_comm(param, stream: torch.cuda.Stream, *, reduce_scatter: b
         _ACTIVE_CAPTURE_COMM_STATE.register_comm(param, stream, reduce_scatter=reduce_scatter)
 
 
-def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
-    """Register a ring slot with the active capture, if one exists."""
+def register_capture_rs_cache_buffer(buffer: torch.Tensor, param) -> None:
+    """Register a lane-local RS output with the active capture, if one exists."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
-        _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_ring_slot(slot, param)
-
-
-def register_capture_rs_fp32_accum_ring_slot(slot: GraphRSFP32AccumRingSlot, param) -> None:
-    """Register an FP32-RS workspace with the active capture, if one exists."""
-    if _ACTIVE_CAPTURE_COMM_STATE is not None:
-        _ACTIVE_CAPTURE_COMM_STATE.register_rs_fp32_accum_ring_slot(slot, param)
+        _ACTIVE_CAPTURE_COMM_STATE.register_rs_cache_buffer(buffer, param)
 
 
 @contextmanager
@@ -140,218 +108,22 @@ def track_gtp_capture_comms():
         _ACTIVE_CAPTURE_COMM_STATE = None
 
 
-# Slots live outside the shared graph pool so independently replayed graphs cannot reuse an
-# in-flight reduce-scatter input as temporary workspace.
-_GRAPH_WGRAD_RINGS: dict[tuple, list[GraphWgradRingSlot]] = {}
-
-
-def allocate_graph_wgrad_rings(
-    params: Iterable,
-    *,
-    full_iteration: bool,
-    async_reduction: bool,
-    ring_size: int,
-    graphed_chain_id: str,
-    stream_key: Callable[[str, object], tuple],
-) -> None:
-    """Allocate bounded persistent inputs for cross-graph asynchronous reduce-scatter.
-
-    Slots are shared across layers only within one communication scheduling domain. A two-slot
-    ring retains one graph of overlap without allocating one full unsharded wgrad per layer.
-    """
-    if full_iteration or not async_reduction or _GRAPH_WGRAD_RINGS:
-        return
-    if ring_size < 1:
-        raise ValueError("GTP_CONFIG.graph_wgrad_ring_size must be at least 1")
-
-    params_by_key = defaultdict(list)
-    seen_params = set()
-    for chain_param in params:
-        if not getattr(chain_param, "is_gtp_weight_remat", False):
-            continue
-        if chain_param.chain_id != graphed_chain_id or chain_param.prev_w is None:
-            continue
-        for param in chain_param._weights:
-            if id(param) in seen_params:
-                continue
-            seen_params.add(id(param))
-            if not hasattr(param, "main_grad"):
-                raise RuntimeError(
-                    "GTP wgrad rings must be initialized after DDP creates param.main_grad"
-                )
-            key = (
-                stream_key(param.chain_id, param.group),
-                param._unsharded_shape,
-                param._unsharded_shape_padded,
-                param.main_grad.dtype,
-                param.expert_idx,
-            )
-            params_by_key[key].append(param)
-
-    total_bytes = 0
-    buffer_count = 0
-    new_slots = []
-    for key, matching_params in params_by_key.items():
-        slot_count = min(ring_size, len(matching_params))
-        slots = []
-        exemplar = matching_params[0]
-        for slot_index in range(slot_count):
-            tensor = torch.empty(
-                exemplar._unsharded_shape_padded,
-                dtype=exemplar.main_grad.dtype,
-                device=exemplar.device,
-                memory_format=torch.contiguous_format,
-            )
-            if exemplar.pad_length > 0:
-                tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
-            slot = GraphWgradRingSlot(
-                tensor=tensor,
-                ready_event=torch.cuda.Event(external=True),
-                key=key,
-                index=slot_index,
-            )
-            slots.append(slot)
-            new_slots.append(slot)
-            total_bytes += tensor.numel() * tensor.element_size()
-            buffer_count += 1
-
-        _GRAPH_WGRAD_RINGS[key] = slots
-        for param_index, param in enumerate(matching_params):
-            slot = slots[param_index % slot_count]
-            param._gtp_graph_wgrad_ring_slot = slot
-            if param.pad_length > 0:
-                param._gtp_graph_wgrad_ring_view = slot.tensor.narrow(
-                    0, 0, param._unsharded_shape[0]
-                )
-            else:
-                param._gtp_graph_wgrad_ring_view = slot.tensor
-
-    # Initially every slot is available. Later generations are recorded on the RS stream after NCCL
-    # has finished reading the slot.
-    for slot in new_slots:
-        slot.ready_event.record()
-    if new_slots:
-        torch.cuda.current_stream().synchronize()
-
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[GTP Wgrad Ring] allocated {buffer_count} buffers "
-        f"({total_bytes / 1024**2:.1f} MB), ring_size={ring_size}",
-    )
-
-
-# These workspaces must not come from the eager wgrad pool or the shared CUDA-graph pool. The
-# former may release their captured addresses, while the latter assumes graphs sharing the pool
-# never execute concurrently.
-_GRAPH_RS_FP32_ACCUM_RINGS: dict[tuple, list[GraphRSFP32AccumRingSlot]] = {}
-
-
-def allocate_graph_rs_fp32_accum_rings(
-    params: Iterable,
-    *,
-    full_iteration: bool,
-    fp32_accumulation: bool,
-    ring_size: int,
-    graphed_chain_id: str,
-    stream_key: Callable[[str, object], tuple],
-) -> None:
-    """Allocate bounded persistent workspaces for graph-captured FP32 GTP reduction."""
-    if full_iteration or not fp32_accumulation or _GRAPH_RS_FP32_ACCUM_RINGS:
-        return
-    if ring_size < 1:
-        raise ValueError("GTP_CONFIG.graph_wgrad_ring_size must be at least 1")
-
-    params_by_key = defaultdict(list)
-    seen_params = set()
-    for chain_param in params:
-        if not getattr(chain_param, "is_gtp_weight_remat", False):
-            continue
-        if chain_param.chain_id != graphed_chain_id:
-            continue
-        for param in chain_param._weights:
-            if id(param) in seen_params:
-                continue
-            seen_params.add(id(param))
-            if param.group.size() <= 2:
-                continue
-            if not hasattr(param, "main_grad"):
-                raise RuntimeError(
-                    "GTP FP32-RS rings must be initialized after DDP creates param.main_grad"
-                )
-            key = (
-                stream_key(param.chain_id, param.group),
-                param._unsharded_shape_padded,
-                param.main_grad.dtype,
-                param.expert_idx,
-            )
-            params_by_key[key].append(param)
-
-    total_bytes = 0
-    workspace_count = 0
-    new_slots = []
-    for key, matching_params in params_by_key.items():
-        slot_count = min(ring_size, len(matching_params))
-        slots = []
-        exemplar = matching_params[0]
-        output_shape = (
-            exemplar._unsharded_shape_padded[0] // exemplar.group.size(),
-            *exemplar._unsharded_shape_padded[1:],
-        )
-        for slot_index in range(slot_count):
-            a2a_output = torch.empty(
-                exemplar._unsharded_shape_padded,
-                dtype=exemplar.main_grad.dtype,
-                device=exemplar.device,
-                memory_format=torch.contiguous_format,
-            )
-            fp32_accum_output = torch.empty(
-                output_shape,
-                dtype=torch.float32,
-                device=exemplar.device,
-                memory_format=torch.contiguous_format,
-            )
-            slot = GraphRSFP32AccumRingSlot(
-                a2a_output=a2a_output,
-                fp32_accum_output=fp32_accum_output,
-                ready_event=torch.cuda.Event(external=True),
-                key=key,
-                index=slot_index,
-            )
-            slots.append(slot)
-            new_slots.append(slot)
-            total_bytes += (
-                a2a_output.numel() * a2a_output.element_size()
-                + fp32_accum_output.numel() * fp32_accum_output.element_size()
-            )
-            workspace_count += 1
-
-        _GRAPH_RS_FP32_ACCUM_RINGS[key] = slots
-        for param_index, param in enumerate(matching_params):
-            param._gtp_graph_rs_fp32_accum_ring_slot = slots[param_index % slot_count]
-
-    for slot in new_slots:
-        slot.ready_event.record()
-    if new_slots:
-        torch.cuda.current_stream().synchronize()
-
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[GTP FP32 RS Ring] allocated {workspace_count} workspaces "
-        f"({total_bytes / 1024**2:.1f} MB), ring_size={ring_size}",
-    )
-
-
 _CG_MEMPOOL_DEVICE = None
 _CG_MEMPOOL = None
+_CG_MEMPOOL_LANE = None
 
 
-def set_cuda_graph_mempool(device, mempool) -> None:
-    """Register the shared memory pool used for graph-owned GTP allocations."""
-    global _CG_MEMPOOL_DEVICE, _CG_MEMPOOL
+def set_cuda_graph_mempool(device, mempool, lane=None) -> None:
+    """Register the memory pool and optional lane used by the active graph capture."""
+    global _CG_MEMPOOL_DEVICE, _CG_MEMPOOL, _CG_MEMPOOL_LANE
     _CG_MEMPOOL_DEVICE = device
     _CG_MEMPOOL = mempool
+    _CG_MEMPOOL_LANE = lane
+
+
+def get_cuda_graph_mempool_lane() -> Optional[GTPGraphPoolLane]:
+    """Return the lane assigned to the graph currently being captured."""
+    return _CG_MEMPOOL_LANE
 
 
 @contextmanager
