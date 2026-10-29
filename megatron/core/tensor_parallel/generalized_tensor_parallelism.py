@@ -487,6 +487,8 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     # race peers' main_grad.add_ still queued on rs_stream.
     if not torch.cuda.is_current_stream_capturing():
         _close_wgrad_accumulation_windows()
+        # The optimizer step follows this fence: a gather issued before it is not reused after.
+        get_global_GTP_cache().step_boundary()
     # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
     # whole-step capture there are no runners, so stop here while capturing.
     if torch.cuda.is_current_stream_capturing():
@@ -505,6 +507,11 @@ class GTPRematConfig:
     pad_for_alignment: int = 16
     check_param_states: bool = False
     weight_prefetch: bool = True
+    # A weight consumed several times in a row (the output layer under every MTP head and the
+    # main head, forward and dgrad) is gathered once per step: a repeated consume reads the
+    # cache buffer again while its last gather is this weight's own and no optimizer step has
+    # run. False gathers for every consume (the reference for the parity test).
+    reuse_gathered_weights: bool = True
     # True (default): non-chain-head wgrad RS is async_op=True and finalizes
     # (handle.wait + main_grad.add_) in a later bwd's cascade walk, overlapping RS with
     # compute. False: every wgrad RS is synchronous + inline (no overlap).
@@ -1545,17 +1552,17 @@ class GTPShardedParam(torch.nn.Parameter):
                     p._ag_ticket_recompute = cache.reserve(p, dt, fwd=True, recompute=True)
                     cache.get(p._ag_ticket_recompute)
                     cache.release(p._ag_ticket_recompute)
-                out_buffers.append(cache.get(p._ag_ticket_recompute))
+                out_buffers.append(cache.bind_for_gather(p._ag_ticket_recompute))
             elif fwd:
                 if p._ag_ticket_fwd is None:
                     p._ag_ticket_fwd = cache.reserve(p, dt, fwd=True)
                     cache.get(p._ag_ticket_fwd)
                     cache.release(p._ag_ticket_fwd)
-                out_buffers.append(cache.get(p._ag_ticket_fwd))
+                out_buffers.append(cache.bind_for_gather(p._ag_ticket_fwd))
             else:
                 if p._ag_ticket_bwd is None:
                     p._ag_ticket_bwd = cache.reserve(p, dt, fwd=False)
-                out_buffers.append(cache.get(p._ag_ticket_bwd))
+                out_buffers.append(cache.bind_for_gather(p._ag_ticket_bwd))
 
         # 5. Communicate.
         gtp_remat_group = self._cached_gtp_remat_group
@@ -1651,6 +1658,38 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [self._strip_padding(r) for r in result]
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
+
+    def _reuse_gathered(self, fwd: bool):
+        """The weight gathered earlier in this step, when its cache buffer still holds that
+        gather: a weight consumed several times in a row (the output layer under every MTP
+        head and the main head, forward and dgrad) is gathered once. A plain-dtype weight
+        gathers the same bytes in both directions, so either direction's buffer serves.
+        ``None`` when the buffer has been gathered into by another ticket since, after the
+        step boundary, or with ``reuse_gathered_weights`` off."""
+        if not GTP_CONFIG.reuse_gathered_weights or self.is_routed_expert:
+            return None
+        cache = get_global_GTP_cache()
+        tickets = [self._ag_ticket_fwd if fwd else self._ag_ticket_bwd]
+        if getattr(self, "_gtp_gather_quantizer", None) is None and not getattr(
+            self, "_gtp_native_fp8", False
+        ):
+            tickets.append(self._ag_ticket_bwd if fwd else self._ag_ticket_fwd)
+        for ticket in tickets:
+            buf = cache.gathered(ticket)
+            if buf is not None:
+                return self._strip_padding(buf).detach().requires_grad_(self.requires_grad)
+        return None
+
+    def _prefetch_pending(self, fwd: bool) -> bool:
+        """A prefetch of this weight issued this step is still waiting for its consumer, in a
+        buffer nothing else has gathered into. The neighbour that prefetches a weight may run
+        more than once before the weight does (an MTP layer replayed per depth); issuing again
+        would only repeat the gather."""
+        if not GTP_CONFIG.reuse_gathered_weights or self._prefetch_handle is None:
+            return False
+        return get_global_GTP_cache().unconsumed_this_step(
+            self._ag_ticket_fwd if fwd else self._ag_ticket_bwd
+        )
 
     def _prefetch_available(self) -> bool:
         """True when an all-gather was actually issued for THIS consume (either direction).
@@ -1811,13 +1850,16 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.weight_prefetch and self._prefetch_available():
             result = self._get_prefetched_weight(False)
         else:
-            result = self._all_gather_weight_on_demand(False)
+            result = self._reuse_gathered(fwd=False)
+            if result is None:
+                result = self._all_gather_weight_on_demand(False)
 
         if (
             GTP_CONFIG.weight_prefetch
             and self.prev_w is not None
             and self.prev_w._need_weight_prefetch
             and self.prev_w._need_weight_prefetch_bwd
+            and not self.prev_w._prefetch_pending(fwd=False)
         ):
             # Pre-AG work (quantize, ticket lookup) runs on caller's stream; the NCCL collective
             # is wrapped on ag_stream inside _all_gather_weight (see its async/sync gate).
@@ -1879,9 +1921,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 ),
             )
         else:
-            # On-demand: fwd chain head or first-iter build. Deliberately called with the
-            # original signature so the recompute plumbing never perturbs the fwd path.
-            result = self._all_gather_weight_on_demand(True)
+            # On-demand: fwd chain head, a repeated consume or the first-iter build. Called
+            # with the original signature so the recompute plumbing never perturbs the fwd path.
+            result = None if in_recompute else self._reuse_gathered(fwd=True)
+            if result is None:
+                result = self._all_gather_weight_on_demand(True)
 
         # Prefetch next weight on the matching chain.
         if (
@@ -1895,6 +1939,7 @@ class GTPShardedParam(torch.nn.Parameter):
             and GTP_CONFIG.weight_prefetch
             and self.next_w is not None
             and self.next_w._need_weight_prefetch
+            and not self.next_w._prefetch_pending(fwd=fwd)
         ):
             # Pre-AG work on caller; NCCL wrap lives at the collective site
             # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
@@ -2636,6 +2681,7 @@ class _TicketSlot:
     fwd: bool
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
+    step: int = -1  # step of this ticket's last gather (see GTPWeightCache.gathered)
 
 
 class GTPWeightCache:
@@ -2665,6 +2711,10 @@ class GTPWeightCache:
         self._next_ticket: int = 0
         self._total_bytes: int = 0  # running total of allocated bytes
         self.key_to_allocate_func = {}
+        # id(buffer) -> ticket of the last gather issued into it. Same-key tickets share a
+        # buffer, so this is what tells a repeated consume whether the bytes are still its own.
+        self._writer: Dict[int, int] = {}
+        self._step: int = 0  # advanced by step_boundary(); gathers are reusable within a step
 
     @staticmethod
     def _buf_bytes(shape, dtype) -> int:
@@ -2761,6 +2811,45 @@ class GTPWeightCache:
 
         return slot.buf
 
+    def bind_for_gather(self, ticket: int) -> torch.Tensor:
+        """The buffer a gather for ``ticket`` is about to write (``get``), recorded as the
+        buffer's last writer so a repeated consume can tell its own bytes from a neighbour's."""
+        buf = self.get(ticket)
+        # A gather captured into a CUDA graph is replayed without passing here: the buffer's
+        # contents then change outside this bookkeeping, so it is never offered for reuse.
+        captured = torch.cuda.is_current_stream_capturing()
+        self._writer[id(buf)] = -1 if captured else ticket
+        self._slots[ticket].step = self._step
+        return buf
+
+    def gathered(self, ticket: Optional[int]) -> Optional[torch.Tensor]:
+        """The buffer ``ticket`` was gathered into earlier in this step, if no other ticket has
+        gathered into it since: the weights are unchanged until the optimizer step, so the bytes
+        are still this weight's. None otherwise, and for captured chains (their gathers replay
+        inside a graph, unseen here)."""
+        if ticket is None:
+            return None
+        slot = self._slots[ticket]
+        if (
+            slot.buf is None
+            or slot.step != self._step
+            or self._writer.get(id(slot.buf)) != ticket
+            or _chain_is_graphed(slot.chain_id)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        return slot.buf
+
+    def unconsumed_this_step(self, ticket: Optional[int]) -> bool:
+        """Whether ``ticket``'s buffer still holds a gather issued this step for it (a prefetch
+        waiting for its consumer): the same condition as ``gathered``."""
+        return self.gathered(ticket) is not None
+
+    def step_boundary(self) -> None:
+        """Training-step boundary (once per step, after the backward): the optimizer step that
+        follows changes the weights, so no earlier gather is reused afterwards."""
+        self._step += 1
+
     def release(self, ticket: int):
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
@@ -2784,6 +2873,7 @@ class GTPWeightCache:
         for slot in self._slots.values():
             slot.buf = None
         self._pool.clear()
+        self._writer.clear()
         self._total_bytes = 0
 
 

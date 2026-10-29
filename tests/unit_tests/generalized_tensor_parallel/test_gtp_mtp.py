@@ -508,14 +508,18 @@ def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=Fa
 
 
 def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=False, moe=False):
-    """N consumes of a weight need N all-gathers, not the one its chain neighbour issues.
+    """Every consume of a weight reads either a gather issued for it or its own earlier gather.
 
-    The neighbour runs once per pass; MTP consumes shared weights once per prediction head and
-    replays the MTP block once per depth. Extra consumes would ``cache.get()`` a stale buffer --
-    silently, since that keeps the loss finite and merely wrong.
+    The neighbour that prefetches a weight runs once per pass; MTP consumes shared weights once
+    per prediction head and replays the MTP block once per depth. A consume that took the
+    prefetched path without an issue of its own would ``cache.get()`` a stale buffer --
+    silently, since that keeps the loss finite and merely wrong. A repeated consume may instead
+    reuse its own gather (``_reuse_gathered``), which the cache only grants while the buffer's
+    last writer is that weight.
 
-    So: tally all-gathers issued against consumes, and fail if a consume outruns its issues.
-    Behavioural, not structural, so it survives a redesign of how the prefetch is armed.
+    So: tally all-gathers issued and reuses against consumes, fail if a consume outruns them,
+    and require that the shared output table was reused at least once (one gather, not one per
+    head). Behavioural, not structural, so it survives a redesign of how the prefetch is armed.
 
     Does not cover the recompute chain (separate ``_recompute_*`` slots).
     """
@@ -530,9 +534,15 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
     o_ag = P._all_gather_weight
     o_get = P._get_prefetched_weight
     o_ondemand = P._all_gather_weight_on_demand
+    o_reuse = P._reuse_gathered
 
     # Keyed by (name, direction) rather than id(), which can be recycled onto another object.
-    issued, consumed, violations = defaultdict(int), defaultdict(int), []
+    issued, consumed, reused, violations = (
+        defaultdict(int),
+        defaultdict(int),
+        defaultdict(int),
+        [],
+    )
 
     # Signatures spelled out, not *args: a signature change should fail loudly, not mis-key.
     def ag(self, async_op, fwd, nvtx_label=None):
@@ -555,11 +565,20 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
         consumed[(self._debug_name, bool(fwd))] += 1
         return out
 
+    def reuse(self, fwd):
+        # Served from this weight's own earlier gather: a consume with no new issue.
+        out = o_reuse(self, fwd)
+        if out is not None:
+            key = (self._debug_name, bool(fwd))
+            consumed[key] += 1
+            reused[key] += 1
+        return out
+
     saved_pad = GTP_CONFIG.pad_for_alignment
     try:
         GTP_CONFIG.pad_for_alignment = 0
         P._all_gather_weight, P._get_prefetched_weight = ag, get_prefetched
-        P._all_gather_weight_on_demand = on_demand
+        P._all_gather_weight_on_demand, P._reuse_gathered = on_demand, reuse
 
         ps.destroy_model_parallel()
         ps.initialize_model_parallel(
@@ -580,6 +599,7 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
         P._all_gather_weight = o_ag
         P._get_prefetched_weight = o_get
         P._all_gather_weight_on_demand = o_ondemand
+        P._reuse_gathered = o_reuse
         GTP_CONFIG.pad_for_alignment = saved_pad
         ps.destroy_model_parallel()
         GTPShardedParam._chain_state.clear()
@@ -596,6 +616,85 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
         "a GTP weight was consumed without an all-gather issued for that consume, so the GEMM "
         "read a stale shared buffer (silently wrong weights):\n  " + "\n  ".join(violations)
     )
+    table_reuses = sum(n for (name, _), n in reused.items() if "output_layer" in name)
+    assert table_reuses > 0, (
+        "the output table was gathered for every head: a repeated consume of a weight whose "
+        f"buffer still holds its own gather should reuse it (reused={dict(reused)})"
+    )
+
+
+def _worker_reuse_matches_regather(rank, world_size, port, repeated_layer=False, moe=False):
+    """Reusing a weight's own gather for a repeated consume changes the gather count, not the
+    gradients: run the MTP model with ``reuse_gathered_weights`` off (a gather per consume, the
+    reference) and on, same seed and batch, and compare losses, gradients and the number of
+    output-table gathers."""
+    from collections import defaultdict
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    P = GTPShardedParam
+    o_ag = P._all_gather_weight
+    issued = defaultdict(int)
+
+    def ag(self, async_op, fwd, nvtx_label=None):
+        issued[(self._debug_name, bool(fwd))] += 1
+        return o_ag(self, async_op, fwd, nvtx_label=nvtx_label)
+
+    saved_reuse, saved_pad = GTP_CONFIG.reuse_gathered_weights, GTP_CONFIG.pad_for_alignment
+    grads, losses, table_gathers = {}, {}, {}
+    try:
+        GTP_CONFIG.pad_for_alignment = 0
+        P._all_gather_weight = ag
+        for reuse in (False, True):
+            ps.destroy_model_parallel()
+            ps.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                gtp_remat_size=world_size,
+                **_expert_parallel_kwargs(moe, world_size),
+            )
+            model_parallel_cuda_manual_seed(42)
+            torch.manual_seed(42)
+            GTP_CONFIG.reuse_gathered_weights = reuse
+            model = _build_mtp_gpt_model(repeated_layer, moe)
+            classify_gtp_remat_chains([model])
+            issued.clear()
+            losses[reuse] = _forward_backward(model)
+            grads[reuse] = _gathered_main_grads(model)
+            table_gathers[reuse] = {
+                "fwd" if fwd else "bwd": n
+                for (name, fwd), n in issued.items()
+                if "output_layer" in name
+            }
+            del model
+            ps.destroy_model_parallel()
+            GTPShardedParam._chain_state = {}
+            GTPShardedParam._recompute_chain_state = {}
+            GTPShardedParam._link_tables_flushed = False
+    finally:
+        P._all_gather_weight = o_ag
+        GTP_CONFIG.reuse_gathered_weights, GTP_CONFIG.pad_for_alignment = saved_reuse, saved_pad
+
+    # Every rank: without reuse the table is gathered for each of the 2 * (mtp_num_layers + 1)
+    # consumes; with it every dgrad reads the forward gather and the main head reads the last
+    # MTP head's, so at most one forward gather per depth remains (the next depth's embedding
+    # gather shares the buffer and forces the head's prefetch to be issued again).
+    off, on = table_gathers[False], table_gathers[True]
+    assert off == {"fwd": MTP_NUM_LAYERS + 1, "bwd": MTP_NUM_LAYERS + 1}, table_gathers
+    assert "bwd" not in on and on["fwd"] <= MTP_NUM_LAYERS, table_gathers
+    if rank != 0:
+        return
+    torch.testing.assert_close(
+        torch.tensor(losses[True]), torch.tensor(losses[False]), atol=1e-2, rtol=1e-2
+    )
+    ref, test = grads[False], grads[True]
+    assert set(ref) == set(test), "param sets differ between phases"
+    for name in ref:
+        rel = (ref[name] - test[name]).abs().max().item() / (ref[name].abs().max().item() + 1e-8)
+        assert rel < 2e-2, f"{name}: reuse vs re-gather max rel grad err {rel:.3e}"
 
 
 def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False, accumulate=False):
@@ -853,6 +952,13 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
+
+    @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_reusing_a_gather_matches_gathering_per_consume(self, repeated_layer, moe):
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_reuse_matches_regather, 4, repeated_layer, moe)
 
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
