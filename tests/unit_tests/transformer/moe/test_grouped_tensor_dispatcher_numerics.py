@@ -550,6 +550,8 @@ class TestGroupedTensorDispatcherNumerics:
     @pytest.mark.parametrize(
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
+    # CI DEBUG (PR #9538): does DeepEP/NVSHMEM state break later tests in the shared process?
+    @pytest.mark.skip(reason="CI debug: isolate DeepEP state leakage")
     @pytest.mark.parametrize("dispatcher", ["deepep", "deepepv2"])
     @pytest.mark.timeout(180)
     def test_deepep_grouped_tensor_moe_parity(
@@ -598,6 +600,8 @@ class TestGroupedTensorDispatcherNumerics:
         """All-to-All explicitly pads in TEGroupedMLP and removes it before combine."""
         _run_padding_lifecycle_case("alltoall", monkeypatch)
 
+    # CI DEBUG (PR #9538): does DeepEP/NVSHMEM state break later tests in the shared process?
+    @pytest.mark.skip(reason="CI debug: isolate DeepEP state leakage")
     @pytest.mark.parametrize("dispatcher", ["deepep", "deepepv2"])
     @pytest.mark.timeout(180)
     def test_deepep_grouped_tensor_padding_lifecycle(self, dispatcher, monkeypatch):
